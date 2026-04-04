@@ -17,6 +17,42 @@ SYSTEM = platform.system()  # "Darwin", "Windows", "Linux"
 
 
 # ---------------------------------------------------------------------------
+# Orphan ffmpeg cleanup
+# ---------------------------------------------------------------------------
+
+
+def kill_orphan_ffmpeg(own_pid: int | None = None) -> int:
+    """Kill leftover ffmpeg processes from previous runs that still hold
+    VideoToolbox GPU encoder sessions.  Skips processes spawned by *this*
+    Python process (``own_pid``, defaults to ``os.getpid()``).
+
+    Returns the number of processes killed.
+    """
+    if own_pid is None:
+        own_pid = os.getpid()
+
+    killed = 0
+    for proc in psutil.process_iter(["pid", "ppid", "name"]):
+        try:
+            name = (proc.info["name"] or "").lower()
+            if name not in ("ffmpeg", "ffprobe"):
+                continue
+            # Don't kill our own children — they'll be managed normally
+            if proc.info["ppid"] == own_pid:
+                continue
+            # Graceful first, then hard
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                proc.kill()
+            killed += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return killed
+
+
+# ---------------------------------------------------------------------------
 # Queue file location
 # ---------------------------------------------------------------------------
 
@@ -479,8 +515,9 @@ def verify_output(ffprobe_path: Path, output: str,
     #   - Timestamp gaps > 1 second (missing audio — causes loud bang)
     #   - Non-monotonic timestamps (causes desync / bang)
     # ------------------------------------------------------------------
+    proc = None
     try:
-        r = subprocess.run(
+        proc = subprocess.Popen(
             [
                 str(ffprobe_path),
                 "-v", "error",
@@ -489,15 +526,19 @@ def verify_output(ffprobe_path: Path, output: str,
                 "-of", "csv=p=0",
                 output,
             ],
-            capture_output=True, text=True, timeout=180,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
 
-        if r.stderr.strip():
-            return False, f"Audio stream errors detected — keep original"
-
         prev = None
-        for line in r.stdout.splitlines():
-            parts = line.strip().split(",")
+        deadline = time.monotonic() + 180  # 3-minute timeout
+        for raw_line in proc.stdout:
+            if time.monotonic() > deadline:
+                proc.kill()
+                proc.wait(timeout=5)
+                return False, "Audio scan timed out — keep original"
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            parts = line.split(",")
             if not parts or parts[0] in ("", "N/A"):
                 continue
             try:
@@ -514,10 +555,27 @@ def verify_output(ffprobe_path: Path, output: str,
                                    f"— keep original")
             prev = t
 
-    except subprocess.TimeoutExpired:
-        return False, "Audio scan timed out — keep original"
+        proc.wait(timeout=10)
+        stderr_out = proc.stderr.read().decode("utf-8", errors="replace").strip()
+        if stderr_out:
+            return False, f"Audio stream errors detected — keep original"
+
     except Exception as e:
         return False, f"Audio scan error: {e}"
+    finally:
+        if proc:
+            if proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
 
     return True, f"verified {actual:.1f}s — safe to delete"
 
@@ -533,12 +591,26 @@ def run_cli_job(
     subtitle_forced_index: Optional[int],
     encoder: str = "x265",
     encoder_preset: str = "medium",
+    progress_file: Optional[str] = None,
 ) -> subprocess.Popen:
-    """Encode a single file with ffmpeg. Audio is copied bitexactly."""
+    """Encode a single file with ffmpeg. Audio is copied bitexactly.
+
+    If *progress_file* is given, ffmpeg writes structured progress to that
+    file and stdout/stderr are silenced.  The caller polls the file instead
+    of reading a pipe — this eliminates any pipe backpressure that could
+    stall the encoder.
+    """
     ffmpeg_encoder = _ENCODER_MAP.get(encoder, "libx265")
 
-    args = [
-        str(cli_path),
+    args = [str(cli_path)]
+
+    # Use hardware decoding when paired with a hardware encoder — offloads
+    # decode to Apple's dedicated media engine, keeping CPU cool and
+    # preventing thermal throttling during long encodes.
+    if encoder in ("hevc_videotoolbox", "h264_videotoolbox"):
+        args += ["-hwaccel", "videotoolbox"]
+
+    args += [
         "-i", source,
         # Select streams
         "-map", "0:v:0",
@@ -575,20 +647,19 @@ def run_cli_job(
     # Overwrite output without prompting
     args += ["-y", output]
 
-    # stderr → stdout so the caller reads progress from one pipe
-    # Set a memory limit (8 GB) to prevent ffmpeg from consuming all RAM
-    # and crashing the system — especially with VideoToolbox hardware encoding.
-    import resource
-    def _limit_resources():
-        try:
-            mem_limit = 8 * 1024 * 1024 * 1024  # 8 GB
-            resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
-        except Exception:
-            pass  # non-fatal if unsupported
+    if progress_file:
+        # Write structured progress to a file; silence all console output
+        # so ffmpeg never blocks on a pipe write.
+        args += ["-progress", progress_file]
+        return subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
+    # Legacy: pipe-based progress (used by tests / non-VideoToolbox)
     return subprocess.Popen(
         args,
         stderr=subprocess.STDOUT,
         stdout=subprocess.PIPE,
-        preexec_fn=_limit_resources if platform.system() != "Windows" else None,
     )

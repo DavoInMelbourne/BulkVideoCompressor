@@ -4,12 +4,15 @@ Background workers for probing and encoding video files.
 from __future__ import annotations
 
 import itertools
+import os
 import platform
 import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
+
+import psutil
 from typing import Optional
 
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -105,6 +108,11 @@ class ProbeWorker(QThread):
 # leaking GPU encoder sessions.
 _STALL_TIMEOUT = 600  # 10 minutes
 
+# RSS limit for the ffmpeg process (bytes).  Checked periodically during
+# encoding.  If exceeded the encode is killed with a clear error rather than
+# letting ffmpeg silently degrade via failed allocations.
+_RSS_LIMIT = 12 * 1024 * 1024 * 1024  # 12 GB
+
 
 class EncodeWorker(QThread):
     log = pyqtSignal(str)
@@ -115,6 +123,8 @@ class EncodeWorker(QThread):
     skipped = pyqtSignal(int)  # row_index
     size_warning = pyqtSignal(int)  # row_index — output already larger than source at 25%
     crashed = pyqtSignal(int, str)  # row_index, error message
+    baseline_fps = pyqtSignal(float)  # first-file FPS at 10% progress
+    slow_file_abort = pyqtSignal(int)  # row_index — file can't reach min FPS
     # QThread.finished is used directly — defining it here causes a double-fire
 
     # ffmpeg progress line: "frame= 123 fps= 45.2 ... time=00:00:05.12 ... speed=1.82x"
@@ -134,6 +144,8 @@ class EncodeWorker(QThread):
         rf: float,
         encoder: str = "x265",
         encoder_preset: str = "medium",
+        baseline_fps: float = 0.0,
+        min_fps: int = 200,
     ):
         super().__init__()
         self.task = task
@@ -147,6 +159,11 @@ class EncodeWorker(QThread):
         self.encoder_preset = encoder_preset
         self._current_proc = None
         self._current_id = None
+        self._oversize_abort = False
+        self._slow_file_abort = False
+        self._baseline_fps = baseline_fps
+        self._min_fps = min_fps
+        self._last_fps = 0.0
 
     def run(self):
         t = self.task
@@ -169,22 +186,39 @@ class EncodeWorker(QThread):
         # QThread.finished fires automatically when run() returns
 
     def _kill_proc_hard(self):
-        """Ensure the ffmpeg subprocess is dead — prevents leaked GPU sessions."""
+        """Ensure the ffmpeg subprocess is dead — prevents leaked GPU sessions.
+
+        Uses SIGTERM first to let ffmpeg release VideoToolbox hardware encoder
+        sessions gracefully.  SIGKILL is a last resort because it leaks GPU
+        encoder slots (macOS only has ~3-4) and eventually crashes the system.
+        """
         proc = self._current_proc
         if proc is None:
             return
         try:
             if proc.poll() is None:
-                proc.kill()
-                proc.wait(timeout=10)
+                # Stage 1: graceful — lets ffmpeg tear down VideoToolbox
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Stage 2: hard kill
+                    proc.kill()
+                    proc.wait(timeout=10)
+            # Always close the stdout pipe to avoid fd leaks
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
         except Exception:
             pass
         self._current_proc = None
 
     def cancel_current(self):
-        """Kill the currently-running encode process."""
+        """Kill the currently-running encode process (graceful first)."""
         if self._current_proc and self._current_proc.poll() is None:
-            self._current_proc.kill()
+            self._current_proc.terminate()  # SIGTERM, not SIGKILL
 
     # ------------------------------------------------------------------
     # Encoding
@@ -234,25 +268,66 @@ class EncodeWorker(QThread):
             # Always ensure ffmpeg is dead — leaked VideoToolbox sessions
             # exhaust GPU encoder slots and can crash the system.
             if proc and proc.poll() is None:
-                proc.kill()
+                proc.terminate()  # graceful — lets VT release encoder slot
                 try:
                     proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+            # Close the stdout pipe fd to prevent leaks across files
+            if proc and proc.stdout:
+                try:
+                    proc.stdout.close()
                 except Exception:
                     pass
 
-        self._handle_result(proc, t, row)
+        if self._slow_file_abort:
+            self._cleanup_partial(out)
+            self.slow_file_abort.emit(row)
+            return
+        elif self._oversize_abort:
+            self._cleanup_partial(out)
+            self._copy_source_as_output(t["source"], out, row)
+        else:
+            self._handle_result(proc, t, row)
 
     def _read_progress(self, proc, t: dict, row: int):
-        """Read ffmpeg stdout, emit progress signals, kill stalled encodes."""
+        """Read ffmpeg stdout, emit progress signals, kill stalled/OOM encodes.
+
+        Uses os.read() on the raw fd instead of BufferedReader.read() to
+        avoid GIL-holding blocking reads that can cause pipe backpressure
+        and starve ffmpeg of write capacity.
+        """
         duration = t["info"].duration_secs
         src_size = t["source"].stat().st_size
         out = t["output"]
         buf = ""
         _size_checked = False
         _last_progress = time.monotonic()
+        _last_check = 0.0  # throttle periodic checks (RSS, size, UI)
+        pct = 0
+        fps = 0.0
+        eta = ""
 
-        for chunk in iter(lambda: proc.stdout.read(256), b""):
+        # Use the raw fd for reads — os.read() returns immediately with
+        # whatever data is available (no blocking for a specific byte count).
+        # Keep proc.stdout alive so the fd isn't garbage-collected.
+        fd = proc.stdout.fileno()
+
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+
             buf += chunk.decode("utf-8", errors="replace")
+
+            # Parse all complete progress lines
             while "\r" in buf:
                 line, buf = buf.split("\r", 1)
                 m = self._PCT_RE.search(line)
@@ -263,19 +338,79 @@ class EncodeWorker(QThread):
                     speed = float(m.group(3)) or 0.001
                     pct = int(min(99, cur / duration * 100)) if duration > 0 else 0
                     eta = _fmt_eta((duration - cur) / speed) if duration > 0 else ""
-                    self.progress.emit(row, pct, fps, eta)
-                    if not _size_checked and pct >= 25:
-                        _size_checked = True
-                        try:
-                            if out.exists() and out.stat().st_size > src_size * 0.25:
+
+            # Periodic checks — at most once per 5 seconds
+            now = time.monotonic()
+            if now - _last_check >= 5.0:
+                _last_check = now
+
+                # UI update
+                self.progress.emit(row, pct, fps, eta)
+
+                # Size checks
+                if pct >= 25 and not self._oversize_abort:
+                    try:
+                        if out.exists():
+                            out_size = out.stat().st_size
+                            projected = out_size / (pct / 100) if pct > 0 else 0
+                            if not _size_checked and projected > src_size:
+                                _size_checked = True
                                 self.size_warning.emit(row)
-                        except Exception:
-                            pass
-            # Kill stalled encodes that stop producing output
-            if time.monotonic() - _last_progress > _STALL_TIMEOUT:
+                            if pct >= 50 and projected >= src_size:
+                                self._oversize_abort = True
+                                self.log.emit(
+                                    f"  ✗ Output tracking larger than source at {pct}% — aborting\n"
+                                )
+                                proc.terminate()
+                                break
+                    except Exception:
+                        pass
+
+                # RSS check
+                try:
+                    p = psutil.Process(proc.pid)
+                    rss = p.memory_info().rss
+                    if rss > _RSS_LIMIT:
+                        mb = rss // (1024 * 1024)
+                        self.log.emit(
+                            f"  ✗ ffmpeg using {mb}MB RAM — killing to protect system\n"
+                        )
+                        proc.terminate()
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+
+                # Baseline / problem file detection at 10% progress
+                if pct >= 10 and fps > 0 and self._baseline_fps == 0.0:
+                    self._baseline_fps = fps
+                    self.baseline_fps.emit(fps)
+                    self.log.emit(f"  Baseline FPS: {fps:.1f}\n")
+                    if fps <= self._min_fps:
+                        self.log.emit(
+                            f"  ⚠ FPS {fps:.0f} at 10% — below {self._min_fps} threshold\n"
+                        )
+                        self._slow_file_abort = True
+                        proc.terminate()
+                        break
+
+            # Kill stalled encodes
+            if now - _last_progress > _STALL_TIMEOUT:
                 self.log.emit(f"  ✗ Encode stalled for {_STALL_TIMEOUT}s — killing\n")
-                proc.kill()
+                proc.terminate()
                 break
+
+            # Cap buffer
+            if len(buf) > 8192:
+                buf = buf[-4096:]
+
+        # Close the pipe via the wrapper (owns the fd)
+        if proc.stdout:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+        self._last_fps = fps
 
         try:
             proc.wait(timeout=30)
@@ -311,12 +446,24 @@ class EncodeWorker(QThread):
         v_ok, v_msg = verify_output(
             self.ffprobe_path, str(out), t["info"].duration_secs
         )
+        if v_ok and self._last_fps > 0:
+            v_msg += f", FFPS: {self._last_fps:.1f}"
         self.verified.emit(row, v_ok, v_msg)
         self.log.emit(f"  {'✓' if v_ok else '⚠'} {v_msg}\n")
 
         # Check for reverse compression (output larger than source)
         if v_ok:
             self._check_reverse_compression(f, out, row)
+
+    def _copy_source_as_output(self, f: Path, out: Path, row: int):
+        """Copy the original file to the output path (reverse compression)."""
+        msg = "Output tracking larger than source — copied original instead"
+        try:
+            shutil.copy2(str(f), str(out))
+            self.log.emit(f"  Copied original to output: {out.name}")
+        except OSError as e:
+            self.log.emit(f"  ⚠ Could not copy original: {e}")
+        self.reverse_compression.emit(row, msg)
 
     def _check_reverse_compression(self, f: Path, out: Path, row: int):
         try:
