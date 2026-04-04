@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -18,12 +19,13 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from core.handbrake import find_ffmpeg, find_ffprobe
+from core.handbrake import find_ffmpeg, find_ffprobe, kill_orphan_ffmpeg
 from ui.review_dialog import ReviewDialog
 from ui.workers import EncodeWorker, ProbeWorker
 
@@ -69,6 +71,12 @@ class MainWindow(QMainWindow):
         self._row_task_ids: list[int] = []
         self._row_widgets: list[QWidget] = []
         self._completed_rows: set[int] = set()
+        self._baseline_fps: float = 0.0
+        self._cooling_down: bool = False
+        self._caffeinate_proc: Optional[subprocess.Popen] = None
+        self._files_since_cooldown: int = 0
+        self._total_cooldown_secs: int = 0
+        self._problem_file_count: int = 0
         self._build_ui()
         self._auto_detect()
 
@@ -96,7 +104,7 @@ class MainWindow(QMainWindow):
                 "Output Directory",
                 "output_edit",
                 self._browse_output,
-                default="/Users/pauldavies/Movies",
+                default="/Users/pauldavies/Movies/zCompression/_aOutput",
             )
         )
 
@@ -136,6 +144,41 @@ class MainWindow(QMainWindow):
         ol.addWidget(rf_hint)
         ol.addStretch()
         root.addWidget(opt)
+
+        # Thermal safeguards
+        therm = QGroupBox("Thermal Safeguards")
+        tl = QHBoxLayout(therm)
+        tl.addWidget(QLabel("Min FPS:"))
+        self.min_fps_spin = QSpinBox()
+        self.min_fps_spin.setRange(10, 1000)
+        self.min_fps_spin.setValue(200)
+        self.min_fps_spin.setToolTip(
+            "Minimum expected FPS at 10% progress.\n"
+            "Files below this are flagged as problem files."
+        )
+        tl.addWidget(self.min_fps_spin)
+        self._baseline_label = QLabel("")
+        self._baseline_label.setStyleSheet("color: #27ae60; font-weight: bold; font-size: 11px;")
+        tl.addWidget(self._baseline_label)
+        tl.addSpacing(20)
+        tl.addWidget(QLabel("Cool every:"))
+        self.cool_every_spin = QSpinBox()
+        self.cool_every_spin.setRange(1, 200)
+        self.cool_every_spin.setValue(10)
+        self.cool_every_spin.setToolTip("Insert a proactive cooldown after this many files")
+        self.cool_every_spin.setSuffix(" files")
+        tl.addWidget(self.cool_every_spin)
+        tl.addWidget(QLabel("for"))
+        self.cool_mins_spin = QDoubleSpinBox()
+        self.cool_mins_spin.setRange(0.5, 30.0)
+        self.cool_mins_spin.setValue(2.0)
+        self.cool_mins_spin.setSingleStep(0.5)
+        self.cool_mins_spin.setDecimals(1)
+        self.cool_mins_spin.setSuffix(" min")
+        self.cool_mins_spin.setToolTip("Duration of proactive cooldown")
+        tl.addWidget(self.cool_mins_spin)
+        tl.addStretch()
+        root.addWidget(therm)
 
         # CLI path
         cli_grp = QGroupBox("ffmpeg")
@@ -225,6 +268,14 @@ class MainWindow(QMainWindow):
         self.rf_spin.setValue(rf)
 
     def _auto_detect(self):
+        # Kill any orphan ffmpeg/ffprobe processes left from a previous
+        # crash — they hold VideoToolbox GPU encoder slots and leak memory.
+        orphans = kill_orphan_ffmpeg()
+        if orphans:
+            self._log(
+                f"Killed {orphans} orphan ffmpeg process(es) from a previous run."
+            )
+
         cli = find_ffmpeg()
         if cli:
             self.hb_path_edit.setText(str(cli))
@@ -355,6 +406,12 @@ class MainWindow(QMainWindow):
             self._copied_dirs = set()
             self._queued_sources = set()
             self._next_row = 0
+            self._baseline_fps = 0.0
+            self._cooling_down = False
+            self._baseline_label.setText("")
+            self._files_since_cooldown = 0
+            self._total_cooldown_secs = 0
+            self._problem_file_count = 0
             self._cli_path = cli_path
             self._ffprobe_path = find_ffprobe(cli_path)
             self._encoder, self._encoder_preset, _ = PRESETS[
@@ -383,19 +440,39 @@ class MainWindow(QMainWindow):
 
         if not self._encoding_active:
             self._encoding_active = True
+            self._start_caffeinate()
             self.stop_btn.show()
             self.clear_btn.show()
             self._start_next_encode()
 
     def _start_next_encode(self):
+        if self._cooling_down:
+            return  # QTimer will call us when cooldown expires
+
         # Discard the finished worker so Python can reclaim its memory
         if self._encode_worker is not None:
             self._encode_worker.deleteLater()
             self._encode_worker = None
+            self._files_since_cooldown += 1
 
         if not self._pending_tasks:
             self._encoding_active = False
             self._on_encode_finished()
+            return
+
+        # Proactive cooldown every N files
+        cool_every = self.cool_every_spin.value()
+        if self._files_since_cooldown >= cool_every:
+            self._files_since_cooldown = 0
+            cool_mins = self.cool_mins_spin.value()
+            cool_ms = int(cool_mins * 60 * 1000)
+            self._cooling_down = True
+            self._total_cooldown_secs += int(cool_mins * 60)
+            self._log(
+                f"Proactive cooldown: {cool_mins:.1f} minutes "
+                f"after {cool_every} files\n"
+            )
+            QTimer.singleShot(cool_ms, self._resume_after_cooldown)
             return
 
         t, row = self._pending_tasks.pop(0)
@@ -410,6 +487,8 @@ class MainWindow(QMainWindow):
             rf=self.rf_spin.value(),
             encoder=self._encoder,
             encoder_preset=self._encoder_preset,
+            baseline_fps=self._baseline_fps,
+            min_fps=self.min_fps_spin.value(),
         )
         self._encode_worker.log.connect(self._log)
         self._encode_worker.progress.connect(self._on_progress)
@@ -419,6 +498,8 @@ class MainWindow(QMainWindow):
         self._encode_worker.size_warning.connect(self._on_size_warning)
         self._encode_worker.reverse_compression.connect(self._on_reverse_compression)
         self._encode_worker.crashed.connect(self._on_crashed)
+        self._encode_worker.baseline_fps.connect(self._on_baseline_fps)
+        self._encode_worker.slow_file_abort.connect(self._on_slow_file_abort)
         self._encode_worker.finished.connect(self._start_next_encode)
         self._encode_worker.start()
         self._log("DEBUG: worker started")
@@ -602,7 +683,10 @@ class MainWindow(QMainWindow):
         if row < len(self._status_labels):
             self._completed_rows.add(row)
             if ok:
-                self._set_status(row, "✓ Safe to delete", "#27ae60")
+                fps_tag = ""
+                if "FFPS: " in msg:
+                    fps_tag = f", {msg.rsplit('FFPS: ', 1)[1]} FFPS"
+                self._set_status(row, f"✓ Safe to delete{fps_tag}", "#27ae60")
             else:
                 self._set_status(row, "⚠ Keep original", "#c0392b")
             if row < len(self._delete_btns):
@@ -641,6 +725,63 @@ class MainWindow(QMainWindow):
             if row < len(self._delete_btns):
                 self._delete_btns[row].setEnabled(True)
 
+    def _on_baseline_fps(self, fps: float):
+        if self._baseline_fps == 0.0:
+            self._baseline_fps = fps
+            self._baseline_label.setText(f"{fps:.0f} Base FPS")
+            min_fps = self.min_fps_spin.value()
+            if fps > min_fps:
+                self._baseline_label.setStyleSheet(
+                    "color: #27ae60; font-weight: bold; font-size: 11px;"
+                )
+                self._log(f"Thermal baseline set: {fps:.0f} FPS\n")
+            else:
+                self._baseline_label.setStyleSheet(
+                    "color: #c0392b; font-weight: bold; font-size: 11px;"
+                )
+                self._log(
+                    f"⚠ Baseline {fps:.0f} FPS is below min FPS {min_fps} "
+                    f"— decrease your Min FPS setting\n"
+                )
+                self._pending_tasks.clear()
+                self._encoding_active = False
+
+    def _on_slow_file_abort(self, row: int):
+        if not self._encode_worker:
+            return
+        t = self._encode_worker.task
+        retries = t.get("slow_file_retries", 0)
+        t["slow_file_retries"] = retries + 1
+
+        if retries >= 1:
+            # Second attempt still below 200 FPS — mark as problem file
+            if row < len(self._status_labels):
+                self._completed_rows.add(row)
+                self._set_status(row, "Problem file", "#e67e22")
+                self._row_widgets[row].setStyleSheet(
+                    "QWidget { background-color: rgba(230, 126, 34, 0.15); "
+                    "border-left: 4px solid #e67e22; border-radius: 4px; }"
+                )
+                if row < len(self._delete_btns):
+                    self._delete_btns[row].setEnabled(True)
+            self._log(f"  ⚠ Still below {self.min_fps_spin.value()} FPS on retry — marking as problem file\n")
+            self._problem_file_count += 1
+            return
+
+        # First attempt — short pause and retry
+        self._cooling_down = True
+        if row < len(self._status_labels):
+            self._set_status(row, "Retrying in 10s…", "#d35400")
+            self._progress_bars[row].setValue(0)
+        self._log(f"  ⚠ Below {self.min_fps_spin.value()} FPS — retrying in 10 seconds\n")
+        self._pending_tasks.insert(0, (t, row))
+        QTimer.singleShot(10_000, self._resume_after_cooldown)
+
+    def _resume_after_cooldown(self):
+        self._cooling_down = False
+        self._log("Cooldown complete — resuming encoding\n")
+        self._start_next_encode()
+
     # ------------------------------------------------------------------
     # Stop / finish
     # ------------------------------------------------------------------
@@ -656,15 +797,53 @@ class MainWindow(QMainWindow):
         self.stop_btn.hide()
         self.stop_btn.setEnabled(True)
         self._encoding_active = False
-        QMessageBox.information(self, "Done", "All encodes complete.")
+        self._stop_caffeinate()
+
+        # Batch summary
+        total = len(self._completed_rows)
+        cool_mins = self._total_cooldown_secs / 60
+        summary = (
+            f"Batch complete: {total} file(s) processed\n"
+            f"  Problem files:      {self._problem_file_count}\n"
+            f"  Proactive cooldown: {cool_mins:.1f} minutes\n"
+        )
+        self._log(summary)
+        QMessageBox.information(self, "Done", summary)
 
     def closeEvent(self, event):
+        self._stop_caffeinate()
         if self._encode_worker and self._encode_worker.isRunning():
             self._encode_worker.cancel_current()
             if not self._encode_worker.wait(3000):
                 self._encode_worker.terminate()
                 self._encode_worker.wait(2000)
         event.accept()
+
+    # ------------------------------------------------------------------
+    # macOS App Nap prevention
+    # ------------------------------------------------------------------
+
+    def _start_caffeinate(self):
+        """Prevent macOS from throttling encoding via App Nap / idle sleep."""
+        self._stop_caffeinate()
+        try:
+            self._caffeinate_proc = subprocess.Popen(
+                ["caffeinate", "-dims"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._log("caffeinate: preventing App Nap and sleep\n")
+        except Exception:
+            pass
+
+    def _stop_caffeinate(self):
+        if self._caffeinate_proc:
+            try:
+                self._caffeinate_proc.terminate()
+                self._caffeinate_proc.wait(timeout=5)
+            except Exception:
+                pass
+            self._caffeinate_proc = None
 
     # ------------------------------------------------------------------
     # Log
