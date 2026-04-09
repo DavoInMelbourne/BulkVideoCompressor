@@ -54,11 +54,12 @@ class ProbeWorker(QThread):
     probed = pyqtSignal(list)
     failed = pyqtSignal(str)
 
-    def __init__(self, source_dir, output_dir, prefer_english):
+    def __init__(self, source_dir, output_dir, prefer_english, prioritise_dts=True):
         super().__init__()
         self.source_dir = source_dir
         self.output_dir = output_dir
         self.prefer_english = prefer_english
+        self.prioritise_dts = prioritise_dts
 
     def run(self):
         try:
@@ -92,7 +93,7 @@ class ProbeWorker(QThread):
                     "source": f,
                     "output": out,
                     "info": info,
-                    "audio": select_audio_track(info.audio_tracks, self.prefer_english),
+                    "audio": select_audio_track(info.audio_tracks, self.prefer_english, self.prioritise_dts),
                     "subs": select_subtitle_tracks(info.subtitle_tracks),
                 }
             )

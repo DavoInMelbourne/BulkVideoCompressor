@@ -6,6 +6,7 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -129,6 +130,11 @@ class MainWindow(QMainWindow):
         self.audio_combo = QComboBox()
         self.audio_combo.addItems(["English", "Foreign"])
         ol.addWidget(self.audio_combo)
+        ol.addSpacing(12)
+        self.prioritise_dts_checkbox = QCheckBox("Prioritise DTS")
+        self.prioritise_dts_checkbox.setChecked(True)
+        self.prioritise_dts_checkbox.setToolTip("Prefer DTS audio tracks over other codecs")
+        ol.addWidget(self.prioritise_dts_checkbox)
         ol.addSpacing(20)
         ol.addWidget(QLabel("RF Quality:"))
         self.rf_spin = QDoubleSpinBox()
@@ -143,22 +149,27 @@ class MainWindow(QMainWindow):
         rf_hint = QLabel("← lower = better quality · higher = smaller file")
         rf_hint.setStyleSheet("color: #888; font-size: 11px;")
         ol.addWidget(rf_hint)
-        ol.addSpacing(20)
-        ol.addWidget(QLabel("Success suffix:"))
+        ol.addStretch()
+        root.addWidget(opt)
+
+        # Post Processing
+        post = QGroupBox("Post Processing")
+        pl = QHBoxLayout(post)
+        pl.addWidget(QLabel("Success suffix:"))
         self.file_success_suffix = QLineEdit()
         self.file_success_suffix.setFixedWidth(80)
         self.file_success_suffix.setText("Done")
-        self.file_success_suffix.setToolTip("Suffix added to movie/folder name on successful compress")
-        ol.addWidget(self.file_success_suffix)
-        ol.addSpacing(12)
-        ol.addWidget(QLabel("Problem suffix:"))
+        self.file_success_suffix.setToolTip("Suffix added to folder/file on successful compress. Leave empty for no rename.")
+        pl.addWidget(self.file_success_suffix)
+        pl.addSpacing(20)
+        pl.addWidget(QLabel("Problem suffix:"))
         self.file_problem_suffix = QLineEdit()
         self.file_problem_suffix.setFixedWidth(80)
         self.file_problem_suffix.setText("Check")
-        self.file_problem_suffix.setToolTip("Suffix added to movie/folder name on failed compress")
-        ol.addWidget(self.file_problem_suffix)
-        ol.addStretch()
-        root.addWidget(opt)
+        self.file_problem_suffix.setToolTip("Suffix added to folder/file on failed compress. Leave empty for no rename.")
+        pl.addWidget(self.file_problem_suffix)
+        pl.addStretch()
+        root.addWidget(post)
 
         # Thermal safeguards
         therm = QGroupBox("Thermal Safeguards")
@@ -347,6 +358,7 @@ class MainWindow(QMainWindow):
             source_dir=source,
             output_dir=output,
             prefer_english=self.audio_combo.currentText() == "English",
+            prioritise_dts=self.prioritise_dts_checkbox.isChecked(),
         )
         self._probe_worker.log.connect(self._log)
         self._probe_worker.probed.connect(self._on_probed)
@@ -747,10 +759,6 @@ class MainWindow(QMainWindow):
 
         success_suffix = self.file_success_suffix.text().strip()
         problem_suffix = self.file_problem_suffix.text().strip()
-        if not success_suffix:
-            success_suffix = "Done"
-        if not problem_suffix:
-            problem_suffix = "Check"
 
         source_root = Path(self.source_edit.text().strip())
         parent_dir = source_path.parent
@@ -767,25 +775,42 @@ class MainWindow(QMainWindow):
 
         is_root_dir = parent_dir == source_root
         if is_root_dir:
-            new_name = f"{source_path.stem}.{success_suffix if success else problem_suffix}"
-            new_path = parent_dir / new_name
-            if source_path != new_path:
-                try:
-                    source_path.rename(new_path)
-                    self._log(f"  Renamed: {source_path.name} -> {new_name}")
-                except OSError as e:
-                    self._log(f"  ⚠ Could not rename {source_path.name}: {e}")
+            if success_suffix and success:
+                new_name = f"{source_path.stem}.{success_suffix}"
+                new_path = parent_dir / new_name
+                if source_path != new_path:
+                    try:
+                        source_path.rename(new_path)
+                        self._log(f"  Renamed: {source_path.name} -> {new_name}")
+                    except OSError as e:
+                        self._log(f"  ⚠ Could not rename {source_path.name}: {e}")
+            elif problem_suffix and not success:
+                new_name = f"{source_path.stem}.{problem_suffix}"
+                new_path = parent_dir / new_name
+                if source_path != new_path:
+                    try:
+                        source_path.rename(new_path)
+                        self._log(f"  Renamed: {source_path.name} -> {new_name}")
+                    except OSError as e:
+                        self._log(f"  ⚠ Could not rename {source_path.name}: {e}")
             return
 
         video_files = [f for f in parent_dir.iterdir() if f.suffix.lower() in {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts"}]
         is_movie = len(video_files) == 1
 
         if is_movie:
-            suffix = success_suffix if success else problem_suffix
-            self._rename_to_suffix(parent_dir, suffix)
+            if success and success_suffix:
+                self._rename_to_suffix(parent_dir, success_suffix)
+            elif not success and problem_suffix:
+                self._rename_to_suffix(parent_dir, problem_suffix)
         else:
             pending_count = result["total"] - len(result["success"]) - len(result["failed"])
             if pending_count == 0:
+                all_ok = len(result["failed"]) == 0
+                if all_ok and success_suffix:
+                    self._rename_to_suffix(parent_dir, success_suffix)
+                elif not all_ok and problem_suffix:
+                    self._rename_to_suffix(parent_dir, problem_suffix)
                 all_ok = len(result["failed"]) == 0
                 suffix = success_suffix if all_ok else problem_suffix
                 self._rename_to_suffix(parent_dir, suffix)
