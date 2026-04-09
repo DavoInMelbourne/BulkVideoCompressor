@@ -13,10 +13,22 @@ from .mediainfo import VideoInfo, AudioTrack, SubtitleTrack
 # Audio selection
 # ---------------------------------------------------------------------------
 
-def select_audio_track(tracks: list[AudioTrack], prefer_english: bool) -> AudioTrack | None:
+def select_audio_track(tracks: list[AudioTrack], prefer_english: bool, prioritise_dts: bool = True) -> AudioTrack | None:
     if not tracks:
         return None
 
+    if prioritise_dts:
+        # First priority: DTS
+        for t in tracks:
+            if t.codec and "dts" in t.codec.lower():
+                return t
+
+        # Second priority: TrueHD
+        for t in tracks:
+            if t.codec and "truehd" in t.codec.lower():
+                return t
+
+    # Language preference
     if prefer_english:
         for t in tracks:
             if t.language == "eng":

@@ -54,11 +54,12 @@ class ProbeWorker(QThread):
     probed = pyqtSignal(list)
     failed = pyqtSignal(str)
 
-    def __init__(self, source_dir, output_dir, prefer_english):
+    def __init__(self, source_dir, output_dir, prefer_english, prioritise_dts=True):
         super().__init__()
         self.source_dir = source_dir
         self.output_dir = output_dir
         self.prefer_english = prefer_english
+        self.prioritise_dts = prioritise_dts
 
     def run(self):
         try:
@@ -92,7 +93,7 @@ class ProbeWorker(QThread):
                     "source": f,
                     "output": out,
                     "info": info,
-                    "audio": select_audio_track(info.audio_tracks, self.prefer_english),
+                    "audio": select_audio_track(info.audio_tracks, self.prefer_english, self.prioritise_dts),
                     "subs": select_subtitle_tracks(info.subtitle_tracks),
                 }
             )
@@ -125,6 +126,7 @@ class EncodeWorker(QThread):
     crashed = pyqtSignal(int, str)  # row_index, error message
     baseline_fps = pyqtSignal(float)  # first-file FPS at 10% progress
     slow_file_abort = pyqtSignal(int)  # row_index — file can't reach min FPS
+    compression_done = pyqtSignal(int, bool, object)  # row_index, success, source_path
     # QThread.finished is used directly — defining it here causes a double-fire
 
     # ffmpeg progress line: "frame= 123 fps= 45.2 ... time=00:00:05.12 ... speed=1.82x"
@@ -169,6 +171,7 @@ class EncodeWorker(QThread):
         t = self.task
         if t["id"] in self.cancelled:
             self.skipped.emit(self.row)
+            self.compression_done.emit(self.row, False, t["source"])
             return
         self._current_id = t["id"]
         try:
@@ -263,6 +266,7 @@ class EncodeWorker(QThread):
             self.log.emit(f"  ✗ Encoding error: {e}\n")
             self.task_done.emit(row, False)
             self._cleanup_partial(out)
+            self.compression_done.emit(row, False, t["source"])
             return
         finally:
             # Always ensure ffmpeg is dead — leaked VideoToolbox sessions
@@ -287,7 +291,7 @@ class EncodeWorker(QThread):
         if self._slow_file_abort:
             self._cleanup_partial(out)
             self.slow_file_abort.emit(row)
-            return
+            return  # Don't emit compression_done - will retry or handled by _on_slow_file_abort
         elif self._oversize_abort:
             self._cleanup_partial(out)
             self._copy_source_as_output(t["source"], out, row)
@@ -428,6 +432,7 @@ class EncodeWorker(QThread):
             self.skipped.emit(row)
             self.log.emit("  ✗ Cancelled\n")
             self._cleanup_partial(out)
+            self.compression_done.emit(row, False, f)
             return
 
         self.progress.emit(row, 100 if ok else 0, 0, "")
@@ -437,9 +442,11 @@ class EncodeWorker(QThread):
         )
         if not ok:
             self._cleanup_partial(out)
+            self.compression_done.emit(row, False, f)
             return
 
         if not self.ffprobe_path:
+            self.compression_done.emit(row, True, f)
             return
 
         self.log.emit("  Scanning output for errors…")
@@ -454,6 +461,10 @@ class EncodeWorker(QThread):
         # Check for reverse compression (output larger than source)
         if v_ok:
             self._check_reverse_compression(f, out, row)
+        
+        # Emit compression done with final success status
+        final_ok = ok and v_ok
+        self.compression_done.emit(row, final_ok, f)
 
     def _copy_source_as_output(self, f: Path, out: Path, row: int):
         """Copy the original file to the output path (reverse compression)."""
@@ -464,6 +475,7 @@ class EncodeWorker(QThread):
         except OSError as e:
             self.log.emit(f"  ⚠ Could not copy original: {e}")
         self.reverse_compression.emit(row, msg)
+        self.compression_done.emit(row, True, f)
 
     def _check_reverse_compression(self, f: Path, out: Path, row: int):
         try:
@@ -482,6 +494,7 @@ class EncodeWorker(QThread):
                 except OSError as e:
                     self.log.emit(f"  ⚠ Could not copy original: {e}")
                 self.reverse_compression.emit(row, msg)
+                self.compression_done.emit(row, True, f)
         except OSError:
             pass
 
