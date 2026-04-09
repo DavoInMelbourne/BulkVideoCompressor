@@ -17,6 +17,17 @@ def select_audio_track(tracks: list[AudioTrack], prefer_english: bool) -> AudioT
     if not tracks:
         return None
 
+    # First priority: DTS
+    for t in tracks:
+        if t.codec and "dts" in t.codec.lower():
+            return t
+
+    # Second priority: TrueHD
+    for t in tracks:
+        if t.codec and "truehd" in t.codec.lower():
+            return t
+
+    # Third priority: language preference
     if prefer_english:
         for t in tracks:
             if t.language == "eng":

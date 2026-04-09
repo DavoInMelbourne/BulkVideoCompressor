@@ -77,6 +77,7 @@ class MainWindow(QMainWindow):
         self._files_since_cooldown: int = 0
         self._total_cooldown_secs: int = 0
         self._problem_file_count: int = 0
+        self._directory_results: dict[Path, dict] = {}  # dir -> {"total": int, "success": set, "failed": set}
         self._build_ui()
         self._auto_detect()
 
@@ -142,6 +143,20 @@ class MainWindow(QMainWindow):
         rf_hint = QLabel("← lower = better quality · higher = smaller file")
         rf_hint.setStyleSheet("color: #888; font-size: 11px;")
         ol.addWidget(rf_hint)
+        ol.addSpacing(20)
+        ol.addWidget(QLabel("Success suffix:"))
+        self.file_success_suffix = QLineEdit()
+        self.file_success_suffix.setFixedWidth(80)
+        self.file_success_suffix.setText("Done")
+        self.file_success_suffix.setToolTip("Suffix added to movie/folder name on successful compress")
+        ol.addWidget(self.file_success_suffix)
+        ol.addSpacing(12)
+        ol.addWidget(QLabel("Problem suffix:"))
+        self.file_problem_suffix = QLineEdit()
+        self.file_problem_suffix.setFixedWidth(80)
+        self.file_problem_suffix.setText("Check")
+        self.file_problem_suffix.setToolTip("Suffix added to movie/folder name on failed compress")
+        ol.addWidget(self.file_problem_suffix)
         ol.addStretch()
         root.addWidget(opt)
 
@@ -500,6 +515,7 @@ class MainWindow(QMainWindow):
         self._encode_worker.crashed.connect(self._on_crashed)
         self._encode_worker.baseline_fps.connect(self._on_baseline_fps)
         self._encode_worker.slow_file_abort.connect(self._on_slow_file_abort)
+        self._encode_worker.compression_done.connect(self._on_compression_done)
         self._encode_worker.finished.connect(self._start_next_encode)
         self._encode_worker.start()
         self._log("DEBUG: worker started")
@@ -725,6 +741,67 @@ class MainWindow(QMainWindow):
             if row < len(self._delete_btns):
                 self._delete_btns[row].setEnabled(True)
 
+    def _on_compression_done(self, row: int, success: bool, source_path: Path):
+        if source_path not in self._queued_sources:
+            return
+
+        success_suffix = self.file_success_suffix.text().strip()
+        problem_suffix = self.file_problem_suffix.text().strip()
+        if not success_suffix:
+            success_suffix = "Done"
+        if not problem_suffix:
+            problem_suffix = "Check"
+
+        source_root = Path(self.source_edit.text().strip())
+        parent_dir = source_path.parent
+
+        if parent_dir not in self._directory_results:
+            self._directory_results[parent_dir] = {"total": 0, "success": set(), "failed": set()}
+
+        result = self._directory_results[parent_dir]
+        result["total"] += 1
+        if success:
+            result["success"].add(source_path)
+        else:
+            result["failed"].add(source_path)
+
+        is_root_dir = parent_dir == source_root
+        if is_root_dir:
+            new_name = f"{source_path.stem}.{success_suffix if success else problem_suffix}"
+            new_path = parent_dir / new_name
+            if source_path != new_path:
+                try:
+                    source_path.rename(new_path)
+                    self._log(f"  Renamed: {source_path.name} -> {new_name}")
+                except OSError as e:
+                    self._log(f"  ⚠ Could not rename {source_path.name}: {e}")
+            return
+
+        video_files = [f for f in parent_dir.iterdir() if f.suffix.lower() in {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts"}]
+        is_movie = len(video_files) == 1
+
+        if is_movie:
+            suffix = success_suffix if success else problem_suffix
+            self._rename_to_suffix(parent_dir, suffix)
+        else:
+            pending_count = result["total"] - len(result["success"]) - len(result["failed"])
+            if pending_count == 0:
+                all_ok = len(result["failed"]) == 0
+                suffix = success_suffix if all_ok else problem_suffix
+                self._rename_to_suffix(parent_dir, suffix)
+
+    def _rename_to_suffix(self, path: Path, suffix: str):
+        if not suffix:
+            return
+        new_name = f"{path.name}.{suffix}"
+        new_path = path.parent / new_name
+        if path != new_path:
+            try:
+                path.rename(new_path)
+                self._log(f"  Renamed: {path.name} -> {new_name}")
+            except OSError as e:
+                self._log(f"  ⚠ Could not rename {path.name}: {e}")
+
     def _on_baseline_fps(self, fps: float):
         if self._baseline_fps == 0.0:
             self._baseline_fps = fps
@@ -750,6 +827,7 @@ class MainWindow(QMainWindow):
         if not self._encode_worker:
             return
         t = self._encode_worker.task
+        source_path = t["source"]
         retries = t.get("slow_file_retries", 0)
         t["slow_file_retries"] = retries + 1
 
@@ -766,6 +844,9 @@ class MainWindow(QMainWindow):
                     self._delete_btns[row].setEnabled(True)
             self._log(f"  ⚠ Still below {self.min_fps_spin.value()} FPS on retry — marking as problem file\n")
             self._problem_file_count += 1
+
+            # Handle renaming for problem files from slow file abort
+            self._on_compression_done(row, False, source_path)
             return
 
         # First attempt — short pause and retry
