@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -20,6 +23,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QSplitter,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -51,6 +55,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Bulk Video Compressor")
         self.setMinimumWidth(720)
+        self.setMinimumHeight(600)
         self._probe_worker: Optional[ProbeWorker] = None
         self._encode_worker: Optional[EncodeWorker] = None
         self._pending_tasks: list = []
@@ -79,6 +84,7 @@ class MainWindow(QMainWindow):
         self._problem_file_count: int = 0
         self._build_ui()
         self._auto_detect()
+        self._load_prefs()
 
     # ------------------------------------------------------------------
     # UI
@@ -96,7 +102,7 @@ class MainWindow(QMainWindow):
                 "Source Directory",
                 "source_edit",
                 self._browse_source,
-                default="/Users/pauldavies/Movies/zzCompressionHb",
+                default="",
             )
         )
         root.addWidget(
@@ -104,7 +110,7 @@ class MainWindow(QMainWindow):
                 "Output Directory",
                 "output_edit",
                 self._browse_output,
-                default="/Users/pauldavies/Movies/zCompression/_aOutput",
+                default="",
             )
         )
 
@@ -128,6 +134,11 @@ class MainWindow(QMainWindow):
         self.audio_combo = QComboBox()
         self.audio_combo.addItems(["English", "Foreign"])
         ol.addWidget(self.audio_combo)
+        ol.addSpacing(12)
+        self.prioritise_dts_checkbox = QCheckBox("Prioritise DTS")
+        self.prioritise_dts_checkbox.setChecked(True)
+        self.prioritise_dts_checkbox.setToolTip("Prefer DTS audio tracks over other codecs")
+        ol.addWidget(self.prioritise_dts_checkbox)
         ol.addSpacing(20)
         ol.addWidget(QLabel("RF Quality:"))
         self.rf_spin = QDoubleSpinBox()
@@ -144,6 +155,29 @@ class MainWindow(QMainWindow):
         ol.addWidget(rf_hint)
         ol.addStretch()
         root.addWidget(opt)
+
+        # Post Processing
+        post = QGroupBox("Post Processing")
+        pl = QHBoxLayout(post)
+        pl.addWidget(QLabel("Success suffix:"))
+        self.file_success_suffix = QLineEdit()
+        self.file_success_suffix.setFixedWidth(80)
+        self.file_success_suffix.setText("Done")
+        self.file_success_suffix.setToolTip("Suffix added to folder/file on successful compress. Leave empty for no rename.")
+        pl.addWidget(self.file_success_suffix)
+        pl.addSpacing(20)
+        pl.addWidget(QLabel("Problem suffix:"))
+        self.file_problem_suffix = QLineEdit()
+        self.file_problem_suffix.setFixedWidth(80)
+        self.file_problem_suffix.setText("Check")
+        self.file_problem_suffix.setToolTip("Suffix added to folder/file on failed compress. Leave empty for no rename.")
+        pl.addWidget(self.file_problem_suffix)
+        pl.addSpacing(20)
+        self.delete_source_checkbox = QCheckBox("Delete source files")
+        self.delete_source_checkbox.setToolTip("Delete source video file, folder and all contents after successful compress.")
+        pl.addWidget(self.delete_source_checkbox)
+        pl.addStretch()
+        root.addWidget(post)
 
         # Thermal safeguards
         therm = QGroupBox("Thermal Safeguards")
@@ -226,19 +260,25 @@ class MainWindow(QMainWindow):
         self.progress_scroll = QScrollArea()
         self.progress_scroll.setWidget(self.progress_widget)
         self.progress_scroll.setWidgetResizable(True)
-        self.progress_scroll.setFixedHeight(260)
+        self.progress_scroll.setMinimumHeight(200)
         self.progress_scroll.hide()
-        root.addWidget(self.progress_scroll)
 
         # Log
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
-        self.log_edit.setMinimumHeight(160)
+        self.log_edit.setMinimumHeight(80)
         self.log_edit.setStyleSheet(
             "QTextEdit { background-color: #1e1e1e; color: #d4d4d4; "
             "font-family: monospace; font-size: 12px; }"
         )
-        root.addWidget(self.log_edit)
+
+        # Splitter keeps the two panels from overlapping when the window is resized
+        self._bottom_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._bottom_splitter.addWidget(self.progress_scroll)
+        self._bottom_splitter.addWidget(self.log_edit)
+        self._bottom_splitter.setStretchFactor(0, 3)  # progress gets 3/4
+        self._bottom_splitter.setStretchFactor(1, 1)  # log gets 1/4
+        root.addWidget(self._bottom_splitter)
 
     def _btn_style(self, normal, hover):
         return (
@@ -325,6 +365,31 @@ class MainWindow(QMainWindow):
             )
             return
 
+        if self._encoding_active:
+            resp = QMessageBox.question(
+                self,
+                "Encoding In Progress",
+                "Scanning while encoding is active may cause memory issues. "
+                "Continue anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            if mem.available < 2 * 1024 * 1024 * 1024:  # 2GB
+                QMessageBox.warning(
+                    self,
+                    "Low Memory",
+                    f"Only {mem.available // (1024**3)}GB RAM available. "
+                    "Please free memory before scanning.",
+                )
+                return
+        except ImportError:
+            pass
+
         self.scan_btn.setEnabled(False)
         self.scan_btn.setText("Scanning…")
         self._log(f"Scanning {source}…")
@@ -332,6 +397,7 @@ class MainWindow(QMainWindow):
             source_dir=source,
             output_dir=output,
             prefer_english=self.audio_combo.currentText() == "English",
+            prioritise_dts=self.prioritise_dts_checkbox.isChecked(),
         )
         self._probe_worker.log.connect(self._log)
         self._probe_worker.probed.connect(self._on_probed)
@@ -476,7 +542,6 @@ class MainWindow(QMainWindow):
             return
 
         t, row = self._pending_tasks.pop(0)
-        self._log(f"DEBUG: starting worker for row {row}: {t['source'].name}")
         self._encode_worker = EncodeWorker(
             task=t,
             row=row,
@@ -500,9 +565,9 @@ class MainWindow(QMainWindow):
         self._encode_worker.crashed.connect(self._on_crashed)
         self._encode_worker.baseline_fps.connect(self._on_baseline_fps)
         self._encode_worker.slow_file_abort.connect(self._on_slow_file_abort)
+        self._encode_worker.compression_done.connect(self._on_compression_done)
         self._encode_worker.finished.connect(self._start_next_encode)
         self._encode_worker.start()
-        self._log("DEBUG: worker started")
 
     # ------------------------------------------------------------------
     # Progress row UI
@@ -723,7 +788,109 @@ class MainWindow(QMainWindow):
             self._set_status(row, "Cancelled", "#7f8c8d")
             self._completed_rows.add(row)
             if row < len(self._delete_btns):
-                self._delete_btns[row].setEnabled(True)
+                    self._delete_btns[row].setEnabled(True)
+
+    def _on_compression_done(self, row: int, success: bool, output_path: Path):
+        QTimer.singleShot(0, lambda: self._do_compression_done(row, success, output_path))
+
+    def _do_compression_done(self, row: int, success: bool, output_path: Path):
+        try:
+            success_suffix = self.file_success_suffix.text().strip()
+            problem_suffix = self.file_problem_suffix.text().strip()
+
+            delete_source = success and self.delete_source_checkbox.isChecked()
+            suffix = success_suffix if success else problem_suffix
+            if not suffix and not delete_source:
+                return
+
+            output_root = Path(self.output_edit.text().strip())
+            output_dir = output_path.parent
+            has_container = output_dir.resolve() != output_root.resolve()
+
+            renamed_ok = True
+            if suffix:
+                try:
+                    video_files = [f for f in output_dir.iterdir() if f.suffix.lower() in {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts"}]
+                except OSError as e:
+                    self._log(f"  ⚠ Could not read output directory: {e}")
+                    video_files = []
+                is_movie = len(video_files) == 1
+
+                if not success:
+                    self._rename_to_suffix_on_error(row, suffix, has_container)
+                elif is_movie and has_container:
+                    renamed_ok = self._rename_to_suffix(output_dir, suffix)
+                else:
+                    renamed_ok = self._rename_to_suffix(output_path, suffix)
+
+            if delete_source and renamed_ok:
+                self._delete_source_folder(row)
+            elif delete_source and not renamed_ok:
+                self._log(f"  ⚠ Skipping source delete — output rename did not succeed")
+        except Exception as e:
+            self._log(f"  ⚠ Error in post-processing: {e}")
+
+    def _delete_source_folder(self, row: int):
+        try:
+            task_id = self._row_task_ids[row]
+            task = self._tasks_by_id.get(task_id)
+            if not task:
+                return
+            source_file = task.get("source")
+            if not source_file or not source_file.exists():
+                return
+            source_root = Path(self.source_edit.text().strip())
+            source_dir = source_file.parent
+            if source_dir.resolve() == source_root.resolve():
+                # No container folder — delete just the file, not the root
+                source_file.unlink()
+                self._log(f"  Deleted source file: {source_file.name}")
+            else:
+                source_file.unlink()
+                shutil.rmtree(source_dir)
+                self._log(f"  Deleted source: {source_dir}")
+        except Exception as e:
+            self._log(f"  ⚠ Could not delete source: {e}")
+
+    def _rename_to_suffix(self, path: Path, suffix: str) -> bool:
+        if not suffix:
+            return True
+        new_name = f"{path.name}.{suffix}"
+        new_path = path.parent / new_name
+        if path == new_path:
+            return True
+        try:
+            path.rename(new_path)
+            self._log(f"  Renamed: {path.name} -> {new_name}")
+            return True
+        except OSError as e:
+            self._log(f"  ⚠ Could not rename {path.name}: {e}")
+            return False
+
+    def _rename_to_suffix_on_error(self, row: int, suffix: str, has_container: bool = True):
+        try:
+            task_id = self._row_task_ids[row]
+            task = self._tasks_by_id.get(task_id)
+            if not task:
+                return
+            source_file = task.get("source")
+            if not source_file:
+                return
+            if has_container:
+                source_dir = source_file.parent
+                new_name = f"{source_dir.name}.{suffix}"
+                new_path = source_dir.parent / new_name
+                if source_dir != new_path:
+                    source_dir.rename(new_path)
+                    self._log(f"  Renamed (failed): {source_dir.name} -> {new_name}")
+            else:
+                new_name = f"{source_file.stem}.{suffix}{source_file.suffix}"
+                new_path = source_file.parent / new_name
+                if source_file.exists() and source_file != new_path:
+                    source_file.rename(new_path)
+                    self._log(f"  Renamed (failed): {source_file.name} -> {new_name}")
+        except OSError as e:
+            self._log(f"  ⚠ Could not rename failed source: {e}")
 
     def _on_baseline_fps(self, fps: float):
         if self._baseline_fps == 0.0:
@@ -741,10 +908,8 @@ class MainWindow(QMainWindow):
                 )
                 self._log(
                     f"⚠ Baseline {fps:.0f} FPS is below min FPS {min_fps} "
-                    f"— decrease your Min FPS setting\n"
+                    f"— files will continue but may be marked as problem files\n"
                 )
-                self._pending_tasks.clear()
-                self._encoding_active = False
 
     def _on_slow_file_abort(self, row: int):
         if not self._encode_worker:
@@ -808,9 +973,9 @@ class MainWindow(QMainWindow):
             f"  Proactive cooldown: {cool_mins:.1f} minutes\n"
         )
         self._log(summary)
-        QMessageBox.information(self, "Done", summary)
 
     def closeEvent(self, event):
+        self._save_prefs()
         self._stop_caffeinate()
         if self._encode_worker and self._encode_worker.isRunning():
             self._encode_worker.cancel_current()
@@ -818,6 +983,70 @@ class MainWindow(QMainWindow):
                 self._encode_worker.terminate()
                 self._encode_worker.wait(2000)
         event.accept()
+
+    # ------------------------------------------------------------------
+    # Preferences persistence
+    # ------------------------------------------------------------------
+
+    _PREFS_PATH = Path.home() / ".bulkvideocompressor.json"
+
+    def _save_prefs(self):
+        try:
+            prefs = {
+                "source_dir":       self.source_edit.text().strip(),
+                "output_dir":       self.output_edit.text().strip(),
+                "ffmpeg_path":      self.hb_path_edit.text().strip(),
+                "preset":           self.preset_combo.currentText(),
+                "preset_4k":        self.preset_4k_combo.currentText(),
+                "audio_language":   self.audio_combo.currentText(),
+                "prioritise_dts":   self.prioritise_dts_checkbox.isChecked(),
+                "rf_quality":       self.rf_spin.value(),
+                "success_suffix":   self.file_success_suffix.text().strip(),
+                "problem_suffix":   self.file_problem_suffix.text().strip(),
+                "delete_source":    self.delete_source_checkbox.isChecked(),
+                "min_fps":          self.min_fps_spin.value(),
+                "cool_every":       self.cool_every_spin.value(),
+                "cool_mins":        self.cool_mins_spin.value(),
+            }
+            self._PREFS_PATH.write_text(json.dumps(prefs, indent=2))
+        except Exception:
+            pass
+
+    def _load_prefs(self):
+        try:
+            if not self._PREFS_PATH.exists():
+                return
+            prefs = json.loads(self._PREFS_PATH.read_text())
+            if prefs.get("source_dir"):
+                self.source_edit.setText(prefs["source_dir"])
+            if prefs.get("output_dir"):
+                self.output_edit.setText(prefs["output_dir"])
+            if prefs.get("ffmpeg_path"):
+                self.hb_path_edit.setText(prefs["ffmpeg_path"])
+            if prefs.get("preset") in PRESETS:
+                self.preset_combo.setCurrentText(prefs["preset"])
+            if prefs.get("preset_4k") in PRESETS:
+                self.preset_4k_combo.setCurrentText(prefs["preset_4k"])
+            if prefs.get("audio_language") in ("English", "Foreign"):
+                self.audio_combo.setCurrentText(prefs["audio_language"])
+            if "prioritise_dts" in prefs:
+                self.prioritise_dts_checkbox.setChecked(prefs["prioritise_dts"])
+            if "rf_quality" in prefs:
+                self.rf_spin.setValue(prefs["rf_quality"])
+            if "success_suffix" in prefs:
+                self.file_success_suffix.setText(prefs["success_suffix"])
+            if "problem_suffix" in prefs:
+                self.file_problem_suffix.setText(prefs["problem_suffix"])
+            if "delete_source" in prefs:
+                self.delete_source_checkbox.setChecked(prefs["delete_source"])
+            if "min_fps" in prefs:
+                self.min_fps_spin.setValue(prefs["min_fps"])
+            if "cool_every" in prefs:
+                self.cool_every_spin.setValue(prefs["cool_every"])
+            if "cool_mins" in prefs:
+                self.cool_mins_spin.setValue(prefs["cool_mins"])
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # macOS App Nap prevention
