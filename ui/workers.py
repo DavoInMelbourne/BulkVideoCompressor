@@ -181,6 +181,7 @@ class EncodeWorker(QThread):
         t = self.task
         if t["id"] in self.cancelled:
             self.skipped.emit(self.row)
+            self.compression_done.emit(self.row, False, t["source"])
             return
         self._current_id = t["id"]
         try:
@@ -275,6 +276,7 @@ class EncodeWorker(QThread):
             self.log.emit(f"  ✗ Encoding error: {e}\n")
             self.task_done.emit(row, False)
             self._cleanup_partial(out)
+            self.compression_done.emit(row, False, t["source"])
             return
         finally:
             # Always ensure ffmpeg is dead — leaked VideoToolbox sessions
@@ -299,7 +301,7 @@ class EncodeWorker(QThread):
         if self._slow_file_abort:
             self._cleanup_partial(out)
             self.slow_file_abort.emit(row)
-            return
+            return  # Don't emit compression_done - will retry or handled by _on_slow_file_abort
         elif self._oversize_abort:
             self._cleanup_partial(out)
             self._copy_source_as_output(t["source"], out, row)
@@ -482,6 +484,7 @@ class EncodeWorker(QThread):
         except OSError as e:
             self.log.emit(f"  ⚠ Could not copy original: {e}")
         self.reverse_compression.emit(row, msg)
+        self.compression_done.emit(row, True, f)
 
     def _check_reverse_compression(self, f: Path, out: Path, row: int):
         try:
@@ -500,6 +503,7 @@ class EncodeWorker(QThread):
                 except OSError as e:
                     self.log.emit(f"  ⚠ Could not copy original: {e}")
                 self.reverse_compression.emit(row, msg)
+                self.compression_done.emit(row, True, f)
         except OSError:
             pass
 
