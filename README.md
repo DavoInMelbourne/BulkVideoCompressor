@@ -2,7 +2,7 @@
 
 A lightweight macOS desktop app that batch-compresses video files using ffmpeg. Scan a folder, review the detected settings, and let it encode — all with a clean progress UI.
 
-Built for people who want to compress a library of movies quickly without manually adding files to HandBrake one by one. Feed it a folder full of subdirectories and walk away.
+Built for people who want to compress a library of movies or TV shows quickly without manually adding files to an encoder one by one. Point it at a folder and walk away.
 
 ![Python](https://img.shields.io/badge/python-3.11+-blue) ![PyQt6](https://img.shields.io/badge/PyQt6-6.4+-green) ![Platform](https://img.shields.io/badge/platform-macOS-lightgrey)
 
@@ -21,6 +21,7 @@ Made with 💛 by **[Paul Davies](https://github.com/DavoInMelbourne)**
 ## Features
 
 - Recursively scans a source folder for video files across any number of subdirectories
+- Handles files with or without a dedicated container folder
 - Auto-detects resolution, FPS, audio tracks and subtitles per file
 - Review all files before encoding — see exactly what will be processed
 - **Encoding presets** — separate presets for 1080p and 4K content:
@@ -31,7 +32,9 @@ Made with 💛 by **[Paul Davies](https://github.com/DavoInMelbourne)**
   - **Quality H.265 12-bit** — x265 12-bit, medium preset, RF 20
   - **Quality AV1** — SVT-AV1, preset 4, RF 30
 - Audio **bitexact stream copy** — the original audio is copied byte-for-byte, preserving codec, channels, channel layout and bitrate
-- English or Foreign audio track preference
+- **Smart audio track selection** — prefers DTS, then TrueHD, then falls back to language preference (English/Foreign); always falls back to the first available track so foreign films without an English track still process correctly
+- English or Foreign audio language preference
+- **Prioritise DTS** — toggle to prefer DTS/TrueHD tracks regardless of language
 - Subtitles passed through (Forced, Regular, SDH), never burned in
 - Mirrors source folder structure in the output directory
 - Copies non-video files (subtitles, artwork, NFO etc.) per-directory as each directory is encoded
@@ -39,12 +42,29 @@ Made with 💛 by **[Paul Davies](https://github.com/DavoInMelbourne)**
   1. Duration check — output must match source within 2 seconds
   2. Audio packet scan — streams every audio packet timestamp looking for gaps (>1s) and backwards jumps that cause loud-bang / desync issues
 - **Reverse compression detection** — if the output is larger than the source, the original is copied to the output path instead
+- **Post-processing** — automatically rename or clean up after encoding:
+  - Append a custom suffix to the output folder (or file) on success, e.g. `Movie.Done`
+  - Append a custom suffix to the source folder (or file) on failure, e.g. `Movie.Check`
+  - Optionally delete the source file/folder after a verified successful encode
 - Scrollable per-file progress panel with FPS and ETA
 - Cancel individual files or stop everything immediately
 - Dismiss completed rows individually or clear all finished files
 - Add more files to the queue while encoding is already running
 - **Thermal throttle safeguards** — monitors encoding FPS and automatically pauses to let the machine cool down when performance degrades, plus proactive scheduled cooldowns to prevent overheating during long batches
 - **Process safety** — graceful SIGTERM shutdown for ffmpeg (preserves VideoToolbox GPU encoder sessions), orphan process cleanup on startup, bounded memory buffers, explicit pipe closure
+
+---
+
+## Download
+
+**Don't want to use the terminal?** Grab the latest built app from the [Releases page](https://github.com/DavoInMelbourne/BulkVideoCompressor/releases).
+
+1. Download `BulkVideoCompressor.app.zip`
+2. Unzip and drag to your Applications folder
+3. Right-click → **Open** the first time to get past macOS Gatekeeper
+4. Grant **Full Disk Access** in System Settings → Privacy & Security → Full Disk Access
+
+> ffmpeg is still required: `brew install ffmpeg`
 
 ---
 
@@ -104,12 +124,27 @@ The app will be in `dist/`.
 3. **1080p Preset** — encoding preset for content below 4K
 4. **4K Preset** — encoding preset for 2160p/3840p+ content
 5. **Audio Language** — prefer English or Foreign track
-6. **RF Quality** — Constant Quality value (set automatically by preset; lower = better quality / larger file)
-7. **Min FPS** — minimum expected encoding FPS at 10% progress (see Thermal Safeguards below)
-8. **Cool every / for** — proactive cooldown interval (see Thermal Safeguards below)
-9. **ffmpeg Path** — auto-detected; override if needed
-10. Click **Scan & Review** to inspect detected settings
-11. Click **Add to Queue** to start encoding
+6. **Prioritise DTS** — when checked, DTS and TrueHD tracks are preferred over language preference
+7. **RF Quality** — Constant Quality value (set automatically by preset; lower = better quality / larger file)
+8. **Success suffix** — text appended to the output folder/file name on success (e.g. `Done` → `Movie.Done`); leave blank to skip
+9. **Problem suffix** — text appended to the source folder/file name on failure (e.g. `Check` → `Movie.Check`); leave blank to skip
+10. **Delete source files** — if checked, deletes the source file and its folder after a verified successful encode
+11. **Min FPS** — minimum expected encoding FPS at 10% progress (see Thermal Safeguards below)
+12. **Cool every / for** — proactive cooldown interval (see Thermal Safeguards below)
+13. **ffmpeg Path** — auto-detected; override if needed
+14. Click **Scan & Review** to inspect detected settings
+15. Click **Add to Queue** to start encoding
+
+### Post-processing behaviour
+
+| Scenario | has container folder | Result |
+|---|---|---|
+| Success | Yes | Output folder renamed, e.g. `Movie` → `Movie.Done` |
+| Success | No (file in root) | Output file renamed, e.g. `Movie.mkv` → `Movie.Done.mkv` |
+| Failed/error | Yes | Source folder renamed, e.g. `Movie` → `Movie.Check` |
+| Failed/error | No (file in root) | Source file renamed, e.g. `Movie.mkv` → `Movie.Check.mkv` |
+| Delete source | Yes | Source file deleted, then source folder deleted |
+| Delete source | No (file in root) | Source file deleted only (root folder is never deleted) |
 
 ### Status badges
 
@@ -181,8 +216,9 @@ The app is designed for unattended overnight batch encoding. Key safeguards:
 - **Bounded buffers** — the progress-reading buffer is capped at 8KB to prevent unbounded memory growth.
 - **Pipe cleanup** — stdout pipes are explicitly closed after every encode to prevent file descriptor leaks.
 - **Streaming verification** — audio packet scanning streams ffprobe output line-by-line instead of loading it all into memory.
-- **8GB memory limit** — each ffmpeg process is capped via `RLIMIT_AS` (macOS/Linux).
+- **Memory monitoring** — each ffmpeg process is watched via psutil; if RSS exceeds 12GB the encode is killed with a clear error.
 - **App Nap prevention** — `caffeinate -dims` runs during encoding to prevent macOS from throttling ffmpeg when the screen is locked or idle.
+- **Large file support** — the encode queue correctly handles files of any size; post-processing runs asynchronously so a slow verification scan on a large output file does not stall the queue.
 
 ---
 
@@ -210,6 +246,37 @@ BulkVideoCompressor/
   tests/
     test_process_cleanup.py  # 33 tests covering process safety and thermal safeguards
 ```
+
+---
+
+## Cutting a Release
+
+When you're ready to publish a new version:
+
+```bash
+# 1. Build the app
+pip install pyinstaller
+pyinstaller --onefile --windowed --name "BulkVideoCompressor" main.py
+
+# 2. Zip it (GitHub needs a zip — .app files are actually folders)
+cd dist && zip -r BulkVideoCompressor.app.zip BulkVideoCompressor.app && cd ..
+
+# 3. Tag the release in git
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Then on GitHub:
+- Go to **Releases** → **Draft a new release**
+- Pick the tag you just pushed
+- Attach `dist/BulkVideoCompressor.app.zip`
+- Publish
+
+> **Local use:** drag `dist/BulkVideoCompressor.app` straight to your Applications folder — no need to zip.
+>
+> **GitHub Release:** attach the `.zip` — when users download and unzip it they get the `.app`.
+
+The download link in this README will point users straight to the Releases page.
 
 ---
 
