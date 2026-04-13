@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -93,6 +94,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
+        about_action = QAction("About BVC", self)
+        about_action.triggered.connect(self._show_about)
+        self.menuBar().addMenu("BulkVideoCompressor").addAction(about_action)
+
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
@@ -339,6 +344,17 @@ class MainWindow(QMainWindow):
     def _on_preset_changed(self, name: str):
         _, _, rf = PRESETS[name]
         self.rf_spin.setValue(rf)
+
+    def _show_about(self):
+        QMessageBox.about(
+            self,
+            "About Bulk Video Compressor",
+            "<b>Bulk Video Compressor</b><br>"
+            "by <a href='https://github.com/DavoInMelbourne'>DavoInMelbourne</a><br><br>"
+            "Batch compress video libraries using ffmpeg.<br>"
+            "Built for people who want to compress a library of movies or TV shows "
+            "quickly without manually adding files to an encoder one by one.",
+        )
 
     def _auto_detect(self):
         # Kill any orphan ffmpeg/ffprobe processes left from a previous
