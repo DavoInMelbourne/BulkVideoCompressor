@@ -18,6 +18,7 @@ from typing import Optional
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.handbrake import run_cli_job, verify_output
+from core.languages import Language
 from core.mediainfo import probe_file
 from core.queue_builder import select_audio_track, select_subtitle_tracks
 from core.scanner import get_output_path, scan_directory
@@ -54,11 +55,14 @@ class ProbeWorker(QThread):
     probed = pyqtSignal(list)
     failed = pyqtSignal(str)
 
-    def __init__(self, source_dir, output_dir, prefer_english, prioritise_dts=True):
+    def __init__(self, source_dir, output_dir, audio_language, subtitle_language,
+                 fallback_language, prioritise_dts=True):
         super().__init__()
         self.source_dir = source_dir
         self.output_dir = output_dir
-        self.prefer_english = prefer_english
+        self.audio_language = audio_language
+        self.subtitle_language = subtitle_language
+        self.fallback_language = fallback_language
         self.prioritise_dts = prioritise_dts
 
     def run(self):
@@ -103,8 +107,10 @@ class ProbeWorker(QThread):
                     "source": f,
                     "output": out,
                     "info": info,
-                    "audio": select_audio_track(info.audio_tracks, self.prefer_english, self.prioritise_dts),
-                    "subs": select_subtitle_tracks(info.subtitle_tracks),
+                    "audio": select_audio_track(info.audio_tracks, self.audio_language,
+                                                self.prioritise_dts, self.fallback_language),
+                    "subs": select_subtitle_tracks(info.subtitle_tracks, self.subtitle_language,
+                                                   self.fallback_language),
                 }
             )
         self.probed.emit(tasks)
@@ -139,11 +145,14 @@ class EncodeWorker(QThread):
     compression_done = pyqtSignal(int, bool, object)  # row_index, success, output_path
     # QThread.finished is used directly — defining it here causes a double-fire
 
-    # ffmpeg progress line: "frame= 123 fps= 45.2 ... time=00:00:05.12 ... speed=1.82x"
+    # Full progress line with parseable time (used for pct/eta)
     _PCT_RE = re.compile(
         r"fps=\s*([\d.]+).*?time=([\d:]+\.[\d]*).*?speed=\s*([\d.]+)x",
         re.IGNORECASE,
     )
+    # Minimal match — just fps present (used to reset stall timer when
+    # time=N/A, e.g. REMUX files with DTS-HD MA / TrueHD audio)
+    _FPS_RE = re.compile(r"fps=\s*([1-9][\d.]*)", re.IGNORECASE)
 
     def __init__(
         self,
@@ -352,6 +361,11 @@ class EncodeWorker(QThread):
                     speed = float(m.group(3)) or 0.001
                     pct = int(min(99, cur / duration * 100)) if duration > 0 else 0
                     eta = _fmt_eta((duration - cur) / speed) if duration > 0 else ""
+                elif self._FPS_RE.search(line):
+                    # time=N/A (e.g. REMUX with DTS-HD MA / TrueHD) — process is
+                    # alive and encoding; reset stall timer even without timestamps.
+                    _last_progress = time.monotonic()
+                    fps = float(self._FPS_RE.search(line).group(1))
 
             # Periodic checks — at most once per 5 seconds
             now = time.monotonic()
@@ -469,10 +483,9 @@ class EncodeWorker(QThread):
         self.log.emit(f"  {'✓' if v_ok else '⚠'} {v_msg}\n")
 
         # Check for reverse compression (output larger than source)
-        if v_ok:
-            self._check_reverse_compression(f, out, row)
-        
-        # Emit final result - v_ok includes verification status
+        if v_ok and self._check_reverse_compression(f, out, row):
+            return  # compression_done already emitted by _check_reverse_compression
+
         self.compression_done.emit(row, v_ok, out)
 
     def _copy_source_as_output(self, f: Path, out: Path, row: int):
@@ -484,9 +497,9 @@ class EncodeWorker(QThread):
         except OSError as e:
             self.log.emit(f"  ⚠ Could not copy original: {e}")
         self.reverse_compression.emit(row, msg)
-        self.compression_done.emit(row, True, f)
+        self.compression_done.emit(row, False, out)
 
-    def _check_reverse_compression(self, f: Path, out: Path, row: int):
+    def _check_reverse_compression(self, f: Path, out: Path, row: int) -> bool:
         try:
             src_size = f.stat().st_size
             out_size = out.stat().st_size
@@ -503,9 +516,11 @@ class EncodeWorker(QThread):
                 except OSError as e:
                     self.log.emit(f"  ⚠ Could not copy original: {e}")
                 self.reverse_compression.emit(row, msg)
-                self.compression_done.emit(row, True, f)
+                self.compression_done.emit(row, False, out)
+                return True
         except OSError:
             pass
+        return False
 
     # ------------------------------------------------------------------
     # Helpers
@@ -532,11 +547,32 @@ class EncodeWorker(QThread):
                 self.log.emit(f"  ⚠ failed to copy {src.name}: {e}")
 
     def _cleanup_partial(self, out: Path):
-        """Remove partial output file from a failed/cancelled encode."""
+        """Remove partial output file and any orphaned extras (e.g. subtitles copied
+        before encoding started) from a failed/cancelled encode."""
         try:
             if out.exists():
                 out.unlink()
                 self.log.emit(f"  Removed partial file: {out.name}")
+        except OSError:
+            pass
+        # If the output subdirectory now has no video files, remove any extras
+        # (subtitles, nfo, etc.) that were copied there before encoding started.
+        out_dir = out.parent
+        try:
+            video_exts = {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts"}
+            remaining = list(out_dir.iterdir())
+            has_video = any(f.suffix.lower() in video_exts for f in remaining)
+            if not has_video and remaining:
+                for f in remaining:
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+                self.log.emit(f"  Removed orphaned extras from: {out_dir.name}")
+                try:
+                    out_dir.rmdir()
+                except OSError:
+                    pass
         except OSError:
             pass
 

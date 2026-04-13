@@ -8,56 +8,125 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from .mediainfo import VideoInfo, AudioTrack, SubtitleTrack
+from .languages import Language
 
 # ---------------------------------------------------------------------------
 # Audio selection
 # ---------------------------------------------------------------------------
 
-def select_audio_track(tracks: list[AudioTrack], prefer_english: bool, prioritise_dts: bool = True) -> AudioTrack | None:
+def select_audio_track(
+    tracks: list[AudioTrack],
+    audio_language: Language,
+    prioritise_dts: bool = True,
+    fallback_language: Language | None = None,
+) -> AudioTrack | None:
+    """Select the best audio track.
+
+    Priority order (with prioritise_dts=True):
+      1. DTS/TrueHD in preferred language
+      2. Any codec in preferred language
+      3. DTS/TrueHD in fallback language
+      4. Any codec in fallback language
+      5. DTS/TrueHD in any language
+      6. First track
+
+    With audio_language=ENGLISH the old "prefer English" behaviour is preserved.
+    With any other language, non-English tracks in that language are preferred
+    (i.e. the "Foreign" behaviour is automatically applied for non-English picks).
+    """
     if not tracks:
         return None
 
+    def is_preferred_codec(t: AudioTrack) -> bool:
+        if not t.codec:
+            return False
+        codec = t.codec.lower()
+        return "dts" in codec or "truehd" in codec
+
+    # Resolve ORIGINAL to the language of the first track
+    resolved_language = audio_language
+    if audio_language is Language.ORIGINAL:
+        first_lang = tracks[0].language if tracks else None
+        # Find a Language enum that matches, else treat as NON_ENGLISH fallback
+        resolved_language = next(
+            (l for l in Language if l.codes and first_lang in l.codes),
+            Language.NON_ENGLISH,
+        )
+
+    def try_lang(lang: Language | None, codec_filter: bool) -> AudioTrack | None:
+        if lang is None:
+            return None
+        if lang is Language.NON_ENGLISH:
+            for t in tracks:
+                if not Language.ENGLISH.matches(t.language):
+                    if not codec_filter or is_preferred_codec(t):
+                        return t
+            return None
+        for t in tracks:
+            if lang.matches(t.language):
+                if not codec_filter or is_preferred_codec(t):
+                    return t
+        return None
+
     if prioritise_dts:
-        # First priority: DTS
+        result = try_lang(resolved_language, True)
+        if result:
+            return result
+
+    result = try_lang(resolved_language, False)
+    if result:
+        return result
+
+    if fallback_language and fallback_language != audio_language:
+        if prioritise_dts:
+            result = try_lang(fallback_language, True)
+            if result:
+                return result
+        result = try_lang(fallback_language, False)
+        if result:
+            return result
+
+    if prioritise_dts:
         for t in tracks:
-            if t.codec and "dts" in t.codec.lower():
+            if is_preferred_codec(t):
                 return t
 
-        # Second priority: TrueHD
-        for t in tracks:
-            if t.codec and "truehd" in t.codec.lower():
-                return t
-
-    # Language preference
-    if prefer_english:
-        for t in tracks:
-            if t.language == "eng":
-                return t
-        return tracks[0]
-    else:
-        # Foreign: prefer first non-English
-        for t in tracks:
-            if t.language != "eng":
-                return t
-        return tracks[0]
+    return tracks[0]
 
 
 # ---------------------------------------------------------------------------
 # Subtitle selection
 # ---------------------------------------------------------------------------
 
-def select_subtitle_tracks(tracks: list[SubtitleTrack]) -> list[SubtitleTrack]:
-    """
-    Return English subtitle tracks ordered: Forced → Regular → SDH.
-    All three types included if present; no burn-in.
-    """
-    eng = [t for t in tracks if t.language in ("eng", "")]
+def select_subtitle_tracks(
+    tracks: list[SubtitleTrack],
+    subtitle_language: Language | None = None,
+    fallback_language: Language | None = None,
+) -> list[SubtitleTrack]:
+    """Return subtitle tracks ordered: Forced → Regular → SDH.
 
-    forced = [t for t in eng if t.forced]
-    sdh = [t for t in eng if not t.forced and t.sdh]
-    regular = [t for t in eng if not t.forced and not t.sdh]
+    Tries subtitle_language first, falls back to fallback_language, then
+    falls back to English.  At most one of each type is returned — mapping
+    multiple PGS tracks causes the MKV muxer to stall with time=N/A.
+    """
+    if subtitle_language is None:
+        subtitle_language = Language.ENGLISH
+    if fallback_language is None:
+        fallback_language = Language.ENGLISH
 
-    return forced + regular + sdh
+    def pick(lang: Language) -> list[SubtitleTrack]:
+        matches = [t for t in tracks if lang.matches(t.language)]
+        forced  = [t for t in matches if t.forced]
+        sdh     = [t for t in matches if not t.forced and t.sdh]
+        regular = [t for t in matches if not t.forced and not t.sdh]
+        return forced[:1] + regular[:1] + sdh[:1]
+
+    result = pick(subtitle_language)
+    if not result and fallback_language != subtitle_language:
+        result = pick(fallback_language)
+    if not result and Language.ENGLISH not in (subtitle_language, fallback_language):
+        result = pick(Language.ENGLISH)
+    return result
 
 
 # ---------------------------------------------------------------------------

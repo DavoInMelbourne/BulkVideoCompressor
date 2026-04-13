@@ -610,6 +610,10 @@ def run_cli_job(
     if encoder in ("hevc_videotoolbox", "h264_videotoolbox"):
         args += ["-hwaccel", "videotoolbox"]
 
+    # Increase probe limits so ffmpeg can read codec parameters for all
+    # streams in large REMUX files (e.g. PGS subtitles, TrueHD/DTS-HD MA).
+    args += ["-probesize", "100M", "-analyzeduration", "100M"]
+
     args += [
         "-i", source,
         # Select streams
@@ -638,6 +642,10 @@ def run_cli_job(
         "-c:a", "copy",
         # Subtitles: stream copy
         "-c:s", "copy",
+        # Allow a larger muxer queue so DTS-HD MA / TrueHD audio packets can
+        # be buffered without blocking video encoding (fixes time=N/A in
+        # progress output for REMUX files with lossless audio tracks).
+        "-max_muxing_queue_size", "9999",
     ]
 
     # Mark the first subtitle stream as default+forced if it is a forced track

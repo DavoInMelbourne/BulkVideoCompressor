@@ -32,19 +32,24 @@ Made with 💛 by **[Paul Davies](https://github.com/DavoInMelbourne)**
   - **Quality H.265 12-bit** — x265 12-bit, medium preset, RF 20
   - **Quality AV1** — SVT-AV1, preset 4, RF 30
 - Audio **bitexact stream copy** — the original audio is copied byte-for-byte, preserving codec, channels, channel layout and bitrate
-- **Smart audio track selection** — prefers DTS, then TrueHD, then falls back to language preference (English/Foreign); always falls back to the first available track so foreign films without an English track still process correctly
-- English or Foreign audio language preference
-- **Prioritise DTS** — toggle to prefer DTS/TrueHD tracks regardless of language
-- Subtitles passed through (Forced, Regular, SDH), never burned in
+- **Smart audio track selection** — configurable language preference with automatic fallback; prefers DTS/TrueHD within the chosen language, then falls back to the fallback language, then the first available track
+- **Language Preferences** — independent dropdowns for audio track language, subtitle language, and a fallback language used when the preferred language is not found:
+  - **Original Language** (default) — uses the language of the first audio track in each file, so a mixed batch of English, Korean, French films each picks its own native language automatically
+  - **Non-English** — always picks the first non-English track, regardless of language; useful for batches of foreign-language content
+  - **Specific language** — force a particular language (English, Korean, Japanese, Thai, Vietnamese, French, German, Italian, Spanish, Dutch, Portuguese, Chinese, Polish, Danish, Swedish, Finnish, Norwegian) for the whole batch
+- **Prioritise DTS** — when checked, DTS and TrueHD tracks are preferred within the selected language
+- **Subtitle language** — independently selectable; always defaults to English; falls back to the fallback language, then English if the chosen language is not present
+- Subtitles passed through at most 1 Forced + 1 Regular + 1 SDH per file, never burned in
 - Mirrors source folder structure in the output directory
 - Copies non-video files (subtitles, artwork, NFO etc.) per-directory as each directory is encoded
 - **Post-encode verification** — two-stage check using ffprobe:
   1. Duration check — output must match source within 2 seconds
   2. Audio packet scan — streams every audio packet timestamp looking for gaps (>1s) and backwards jumps that cause loud-bang / desync issues
 - **Reverse compression detection** — if the output is larger than the source, the original is copied to the output path instead
-- **Post-processing** — automatically rename or clean up after encoding:
-  - Append a custom suffix to the output folder (or file) on success, e.g. `Movie.Done`
-  - Append a custom suffix to the source folder (or file) on failure, e.g. `Movie.Check`
+- **Post-processing** — automatically rename and clean up after encoding:
+  - Successful encode: output folder (or file) renamed with a custom suffix, e.g. `Movie.Done`
+  - Failed encode or zero compression (output no smaller than source): source folder renamed with the problem suffix, e.g. `Movie.Check`; source file is copied to the output so nothing is lost
+  - Orphaned extras (subtitles, artwork etc.) are cleaned up if an encode fails partway through
   - Optionally delete the source file/folder after a verified successful encode
 - Scrollable per-file progress panel with FPS and ETA
 - Cancel individual files or stop everything immediately
@@ -123,15 +128,17 @@ The app will be in `dist/`.
 2. **Output Directory** — where encoded files are written, mirroring the source structure
 3. **1080p Preset** — encoding preset for content below 4K
 4. **4K Preset** — encoding preset for 2160p/3840p+ content
-5. **Audio Language** — prefer English or Foreign track
-6. **Prioritise DTS** — when checked, DTS and TrueHD tracks are preferred over language preference
-7. **RF Quality** — Constant Quality value (set automatically by preset; lower = better quality / larger file)
-8. **Success suffix** — text appended to the output folder/file name on success (e.g. `Done` → `Movie.Done`); leave blank to skip
-9. **Problem suffix** — text appended to the source folder/file name on failure (e.g. `Check` → `Movie.Check`); leave blank to skip
-10. **Delete source files** — if checked, deletes the source file and its folder after a verified successful encode
-11. **Min FPS** — minimum expected encoding FPS at 10% progress (see Thermal Safeguards below)
-12. **Cool every / for** — proactive cooldown interval (see Thermal Safeguards below)
-13. **ffmpeg Path** — auto-detected; override if needed
+5. **Audio Language** — preferred audio track language for the batch (see Language Preferences above)
+6. **Subtitles** — preferred subtitle language (default: English)
+7. **Fallback** — language used for both audio and subtitles if the preferred language is not found in a file
+8. **Prioritise DTS** — when checked, DTS and TrueHD tracks are preferred within the selected language
+9. **RF Quality** — Constant Quality value (set automatically by preset; lower = better quality / larger file)
+10. **Success suffix** — text appended to the output folder/file name on success (e.g. `Done` → `Movie.Done`); leave blank to skip
+11. **Problem suffix** — text appended to the source folder/file name on failure (e.g. `Check` → `Movie.Check`); leave blank to skip
+12. **Delete source files** — if checked, deletes the source file and its folder after a verified successful encode
+13. **Min FPS** — minimum expected encoding FPS at 10% progress (see Thermal Safeguards below)
+14. **Cool every / for** — proactive cooldown interval (see Thermal Safeguards below)
+15. **ffmpeg Path** — auto-detected; override if needed
 14. Click **Scan & Review** to inspect detected settings
 15. Click **Add to Queue** to start encoding
 
@@ -212,7 +219,7 @@ The app is designed for unattended overnight batch encoding. Key safeguards:
 
 - **Graceful process shutdown** — ffmpeg is sent SIGTERM first, with a 5-second window to release VideoToolbox hardware encoder sessions. SIGKILL is only used as a fallback. This prevents GPU encoder slot exhaustion that causes progressive FPS degradation.
 - **Orphan cleanup** — on startup, any leftover ffmpeg/ffprobe processes from a previous crash are detected and killed.
-- **Stall detection** — if ffmpeg produces no progress output for 10 minutes, the process is terminated.
+- **Stall detection** — if ffmpeg produces no measurable encoding progress for 10 minutes, the process is terminated. Files with lossless audio (DTS-HD MA, TrueHD) that report `time=N/A` are handled correctly — activity is detected via FPS output so they are never incorrectly killed.
 - **Bounded buffers** — the progress-reading buffer is capped at 8KB to prevent unbounded memory growth.
 - **Pipe cleanup** — stdout pipes are explicitly closed after every encode to prevent file descriptor leaks.
 - **Streaming verification** — audio packet scanning streams ffprobe output line-by-line instead of loading it all into memory.
@@ -236,8 +243,9 @@ BulkVideoCompressor/
   requirements.txt         # Python dependencies
   core/
     handbrake.py           # ffmpeg process management, verification, orphan cleanup
+    languages.py           # Language enum (audio/subtitle language preferences)
     mediainfo.py           # Video file probing (metadata extraction)
-    queue_builder.py       # Audio/subtitle track selection
+    queue_builder.py       # Audio/subtitle track selection logic
     scanner.py             # Directory scanning and output path mapping
   ui/
     main_window.py         # Main UI, queue management, state machine
