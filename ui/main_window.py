@@ -899,7 +899,10 @@ class MainWindow(QMainWindow):
     def _rename_to_suffix(self, path: Path, suffix: str) -> bool:
         if not suffix:
             return True
-        new_name = f"{path.name}.{suffix}"
+        if path.is_file():
+            new_name = f"{path.stem}.{suffix}{path.suffix}"
+        else:
+            new_name = f"{path.name}.{suffix}"
         new_path = path.parent / new_name
         if path == new_path:
             return True
