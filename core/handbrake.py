@@ -626,8 +626,11 @@ def run_cli_job(
 
     args += ["-c:v", ffmpeg_encoder]
     if encoder in ("hevc_videotoolbox", "h264_videotoolbox"):
-        # VideoToolbox uses -q:v (0–100, lower = better) instead of CRF/preset
+        # VideoToolbox uses -q:v (0–100, higher = better quality) instead of CRF/preset
         args += ["-q:v", str(int(rf)), "-allow_sw", "1"]
+        # hvc1 tag ensures broad compatibility with Apple devices and smart TVs
+        if encoder == "hevc_videotoolbox":
+            args += ["-tag:v", "hvc1"]
     else:
         args += ["-crf", str(rf)]
         if encoder_preset:

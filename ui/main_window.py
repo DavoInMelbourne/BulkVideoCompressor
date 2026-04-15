@@ -37,14 +37,16 @@ from ui.workers import EncodeWorker, ProbeWorker
 
 # (encoder, encoder_preset, default_rf)
 PRESETS: dict[str, tuple[str, str, float]] = {
-    "Fast H.264 (Hardware)": ("h264_videotoolbox", "", 50.0),
-    "Fast H.265 (Hardware)": ("hevc_videotoolbox", "", 50.0),
+    "Fast H.264 (Hardware)": ("h264_videotoolbox", "", 65.0),
+    "Fast H.265 (Hardware)": ("hevc_videotoolbox", "", 82.0),
     "Fast H.264": ("x264", "fast", 22.0),
-    "Balanced H.265": ("x265", "medium", 20.0),
-    "Quality H.265 12-bit": ("x265_12bit", "medium", 20.0),
+    "Balanced H.265": ("x265", "medium", 18.0),
+    "Quality H.265 12-bit": ("x265_12bit", "medium", 20.0),  # RF 20 = excellent quality
     "Quality AV1": ("av1", "4", 30.0),
 }
-DEFAULT_PRESET = "Fast H.265 (Hardware)"
+DEFAULT_PRESET = "Quality H.265 12-bit"
+DEFAULT_PRESET_4K = "Fast H.265 (Hardware)"
+DEFAULT_RF_4K = 55.0
 
 
 # ---------------------------------------------------------------------------
@@ -130,28 +132,51 @@ class MainWindow(QMainWindow):
         self.preset_combo.setCurrentText(DEFAULT_PRESET)
         self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
         ol.addWidget(self.preset_combo)
-        ol.addSpacing(12)
-        ol.addWidget(QLabel("4K:"))
-        self.preset_4k_combo = QComboBox()
-        self.preset_4k_combo.addItems(list(PRESETS.keys()))
-        self.preset_4k_combo.setCurrentText("Fast H.265 (Hardware)")
-        ol.addWidget(self.preset_4k_combo)
-        ol.addSpacing(20)
-        ol.addWidget(QLabel("RF Quality:"))
         self.rf_spin = QDoubleSpinBox()
         self.rf_spin.setRange(0, 100)
         self.rf_spin.setValue(PRESETS[DEFAULT_PRESET][2])
         self.rf_spin.setSingleStep(0.5)
         self.rf_spin.setDecimals(1)
         self.rf_spin.setToolTip(
-            "Lower = better quality / larger file\nHigher = more compression / smaller file"
+            "Software encoders (x264/x265/AV1): lower = better quality\n"
+            "Hardware encoders (VideoToolbox): higher = better quality"
         )
         ol.addWidget(self.rf_spin)
-        rf_hint = QLabel("← lower = better quality · higher = smaller file")
-        rf_hint.setStyleSheet("color: #888; font-size: 11px;")
-        ol.addWidget(rf_hint)
+        self.rf_hint_label = QLabel()
+        self.rf_hint_label.setStyleSheet("color: #888; font-size: 11px;")
+        ol.addWidget(self.rf_hint_label)
+        ol.addSpacing(16)
+        ol.addWidget(QLabel("4K:"))
+        self.preset_4k_combo = QComboBox()
+        self.preset_4k_combo.addItems(list(PRESETS.keys()))
+        self.preset_4k_combo.setCurrentText(DEFAULT_PRESET_4K)
+        self.preset_4k_combo.currentTextChanged.connect(self._on_4k_preset_changed)
+        ol.addWidget(self.preset_4k_combo)
+        self.rf_4k_spin = QDoubleSpinBox()
+        self.rf_4k_spin.setRange(0, 100)
+        self.rf_4k_spin.setValue(DEFAULT_RF_4K)
+        self.rf_4k_spin.setSingleStep(0.5)
+        self.rf_4k_spin.setDecimals(1)
+        self.rf_4k_spin.setToolTip(
+            "RF quality for 4K files.\n"
+            "Software encoders (x264/x265/AV1): lower = better quality\n"
+            "Hardware encoders (VideoToolbox): higher = better quality"
+        )
+        ol.addWidget(self.rf_4k_spin)
+        self.rf_4k_hint_label = QLabel()
+        self.rf_4k_hint_label.setStyleSheet("color: #888; font-size: 11px;")
+        ol.addWidget(self.rf_4k_hint_label)
+        ol.addSpacing(12)
+        reset_btn = QPushButton("Reset to Defaults")
+        reset_btn.setFixedHeight(26)
+        reset_btn.setToolTip("Reset encoding options to default settings")
+        reset_btn.clicked.connect(self._on_reset_defaults)
+        ol.addWidget(reset_btn)
         ol.addStretch()
         root.addWidget(opt)
+        # Initialise hint labels to match the default presets
+        self._update_rf_hint(DEFAULT_PRESET, self.rf_hint_label)
+        self._update_rf_hint(DEFAULT_PRESET_4K, self.rf_4k_hint_label)
 
         # Language Preferences
         lang = QGroupBox("Language Preferences")
@@ -211,9 +236,15 @@ class MainWindow(QMainWindow):
         self.file_problem_suffix.setToolTip("Suffix added to folder/file on failed compress. Leave empty for no rename.")
         pl.addWidget(self.file_problem_suffix)
         pl.addSpacing(20)
-        self.delete_source_checkbox = QCheckBox("Delete source files")
-        self.delete_source_checkbox.setToolTip("Delete source video file, folder and all contents after successful compress.")
-        pl.addWidget(self.delete_source_checkbox)
+        pl.addWidget(QLabel("After success:"))
+        self.delete_source_combo = QComboBox()
+        self.delete_source_combo.addItems(["Keep", "Move to Bin", "Delete Permanently"])
+        self.delete_source_combo.setCurrentText("Keep")
+        self.delete_source_combo.setToolTip(
+            "What to do with the source file/folder after a verified successful encode.\n"
+            "Move to Bin is recommended — files can be recovered if something went wrong."
+        )
+        pl.addWidget(self.delete_source_combo)
         pl.addStretch()
         root.addWidget(post)
 
@@ -223,7 +254,7 @@ class MainWindow(QMainWindow):
         tl.addWidget(QLabel("Min FPS:"))
         self.min_fps_spin = QSpinBox()
         self.min_fps_spin.setRange(10, 1000)
-        self.min_fps_spin.setValue(200)
+        self.min_fps_spin.setValue(80)
         self.min_fps_spin.setToolTip(
             "Minimum expected FPS at 10% progress.\n"
             "Files below this are flagged as problem files."
@@ -341,9 +372,34 @@ class MainWindow(QMainWindow):
         row.addWidget(btn)
         return g
 
+    @staticmethod
+    def _rf_hint_text(preset_name: str) -> str:
+        encoder, _, _ = PRESETS[preset_name]
+        if "videotoolbox" in encoder:
+            return "↑ higher = better qlty"
+        return "↓ lower = better qlty"
+
+    def _update_rf_hint(self, preset_name: str, label: QLabel):
+        label.setText(self._rf_hint_text(preset_name))
+
     def _on_preset_changed(self, name: str):
         _, _, rf = PRESETS[name]
         self.rf_spin.setValue(rf)
+        self._update_rf_hint(name, self.rf_hint_label)
+
+    def _on_4k_preset_changed(self, name: str):
+        _, _, rf = PRESETS[name]
+        self.rf_4k_spin.setValue(rf)
+        self._update_rf_hint(name, self.rf_4k_hint_label)
+
+    def _on_reset_defaults(self):
+        self.preset_combo.setCurrentText(DEFAULT_PRESET)
+        self.rf_spin.setValue(PRESETS[DEFAULT_PRESET][2])
+        self.preset_4k_combo.setCurrentText(DEFAULT_PRESET_4K)
+        self.rf_4k_spin.setValue(DEFAULT_RF_4K)
+        self._update_rf_hint(DEFAULT_PRESET, self.rf_hint_label)
+        self._update_rf_hint(DEFAULT_PRESET_4K, self.rf_4k_hint_label)
+        self.min_fps_spin.setValue(80)
 
     def _show_about(self):
         QMessageBox.about(
@@ -469,10 +525,9 @@ class MainWindow(QMainWindow):
 
         # Assign per-task encoder based on resolution
         encoder_std, encoder_preset_std, _ = PRESETS[self.preset_combo.currentText()]
-        encoder_4k, encoder_preset_4k, rf_4k = PRESETS[
-            self.preset_4k_combo.currentText()
-        ]
+        encoder_4k, encoder_preset_4k, _ = PRESETS[self.preset_4k_combo.currentText()]
         rf_std = self.rf_spin.value()
+        rf_4k = self.rf_4k_spin.value()
         for t in tasks:
             info = t["info"]
             if info.height >= 2160 or info.width >= 3840:
@@ -529,12 +584,14 @@ class MainWindow(QMainWindow):
             self._files_since_cooldown = 0
             self._total_cooldown_secs = 0
             self._problem_file_count = 0
+            self._directory_results = {}
             self._cli_path = cli_path
             self._ffprobe_path = find_ffprobe(cli_path)
             self._encoder, self._encoder_preset, _ = PRESETS[
                 self.preset_combo.currentText()
             ]
 
+        source_root = Path(self.source_edit.text().strip())
         added = 0
         skipped = 0
         for t in tasks:
@@ -548,6 +605,14 @@ class MainWindow(QMainWindow):
             self._pending_tasks.append((t, self._next_row))
             self._next_row += 1
             added += 1
+            # Track files per source directory (for deferring multi-file dir operations)
+            src_dir = src.parent
+            if src_dir.resolve() != source_root.resolve():
+                if src_dir not in self._directory_results:
+                    self._directory_results[src_dir] = {
+                        "total": 0, "done": set(), "success_count": 0, "failed_count": 0
+                    }
+                self._directory_results[src_dir]["total"] += 1
 
         self.progress_scroll.show()
         msg = f"→ {added} file(s) added to encode queue."
@@ -699,7 +764,7 @@ class MainWindow(QMainWindow):
         info = t["info"]
         audio = t["audio"]
         subs = t["subs"]
-        rf = self.rf_spin.value()
+        rf = t.get("rf", self.rf_spin.value())
 
         fps_str = f"{info.fps:.3f}".rstrip("0").rstrip(".")
         audio_str = (
@@ -849,8 +914,45 @@ class MainWindow(QMainWindow):
             success_suffix = self.file_success_suffix.text().strip()
             problem_suffix = self.file_problem_suffix.text().strip()
 
-            delete_source = success and self.delete_source_checkbox.isChecked()
-            suffix = success_suffix if success else problem_suffix
+            delete_action = self.delete_source_combo.currentText()  # "Keep" / "Move to Bin" / "Delete Permanently"
+            delete_source = delete_action != "Keep"
+
+            # Resolve task/source info
+            task_id = self._row_task_ids[row] if row < len(self._row_task_ids) else None
+            task = self._tasks_by_id.get(task_id) if task_id is not None else None
+            source_file = task["source"] if task else None
+            source_root = Path(self.source_edit.text().strip())
+
+            # Determine if this file lives inside a named subdirectory (i.e. has a container)
+            no_container = True
+            dir_info = None
+            if source_file:
+                src_dir = source_file.parent
+                no_container = src_dir.resolve() == source_root.resolve()
+                dir_info = self._directory_results.get(src_dir)
+
+            # Update per-directory tracking for files in a subdirectory
+            if dir_info is not None:
+                dir_info["done"].add(source_file)
+                if success:
+                    dir_info["success_count"] += 1
+                else:
+                    dir_info["failed_count"] += 1
+
+            # For multi-file directories: defer rename/delete until all files in that dir
+            # are processed. Single files (movies) and files directly in source root proceed
+            # immediately.
+            is_multi_file_dir = dir_info is not None and dir_info["total"] > 1
+            if is_multi_file_dir:
+                dir_all_done = len(dir_info["done"]) >= dir_info["total"]
+                if not dir_all_done:
+                    return  # wait for remaining files in this directory
+                # Use success suffix only if every file in the dir succeeded
+                effective_success = dir_info["failed_count"] == 0
+            else:
+                effective_success = success
+
+            suffix = success_suffix if effective_success else problem_suffix
             if not suffix and not delete_source:
                 return
 
@@ -860,25 +962,20 @@ class MainWindow(QMainWindow):
 
             renamed_ok = True
             if suffix:
-                try:
-                    video_files = [f for f in output_dir.iterdir() if f.suffix.lower() in {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts"}]
-                except OSError as e:
-                    self._log(f"  ⚠ Could not read output directory: {e}")
-                    video_files = []
-                is_movie = len(video_files) == 1
+                if not effective_success and has_container:
+                    # Encode failed — copy source into output dir so the user can inspect it,
+                    # but only if the output dir has no video at all.
+                    try:
+                        video_files = [
+                            f for f in output_dir.iterdir()
+                            if f.suffix.lower() in {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts"}
+                        ]
+                    except OSError:
+                        video_files = []
+                    if not video_files and not is_multi_file_dir:
+                        self._copy_source_to_output(row, output_dir)
 
-                if not success:
-                    # If output dir is under output_root and has a video file, the source
-                    # was copied there (zero compression) — rename the output dir.
-                    in_output_root = output_dir.resolve().is_relative_to(output_root.resolve())
-                    if in_output_root and video_files:
-                        if is_movie and has_container:
-                            renamed_ok = self._rename_to_suffix(output_dir, suffix)
-                        else:
-                            renamed_ok = self._rename_to_suffix(output_path, suffix)
-                    else:
-                        self._rename_to_suffix_on_error(row, suffix, has_container)
-                elif is_movie and has_container:
+                if has_container:
                     renamed_ok = self._rename_to_suffix(output_dir, suffix)
                 else:
                     renamed_ok = self._rename_to_suffix(output_path, suffix)
@@ -899,10 +996,19 @@ class MainWindow(QMainWindow):
             source_file = task.get("source")
             if not source_file or not source_file.exists():
                 return
+            use_bin = self.delete_source_combo.currentText() == "Move to Bin"
             source_root = Path(self.source_edit.text().strip())
             source_dir = source_file.parent
-            if source_dir.resolve() == source_root.resolve():
-                # No container folder — delete just the file, not the root
+            no_container = source_dir.resolve() == source_root.resolve()
+            target = source_file if no_container else source_dir
+            if use_bin:
+                subprocess.run(
+                    ["osascript", "-e",
+                     f'tell application "Finder" to delete POSIX file "{target}"'],
+                    capture_output=True, timeout=10,
+                )
+                self._log(f"  Moved to Bin: {target.name}")
+            elif no_container:
                 source_file.unlink()
                 self._log(f"  Deleted source file: {source_file.name}")
             else:
@@ -911,6 +1017,34 @@ class MainWindow(QMainWindow):
                 self._log(f"  Deleted source: {source_dir}")
         except Exception as e:
             self._log(f"  ⚠ Could not delete source: {e}")
+
+    def _copy_source_to_output(self, row: int, output_dir: Path):
+        try:
+            task_id = self._row_task_ids[row]
+            task = self._tasks_by_id.get(task_id)
+            if not task:
+                return
+            source_file = task.get("source")
+            if not source_file:
+                return
+            output_dir.mkdir(parents=True, exist_ok=True)
+            source_root = Path(self.source_edit.text().strip())
+            source_dir = source_file.parent
+            no_container = source_dir.resolve() == source_root.resolve()
+            if no_container:
+                files_to_copy = [source_file]
+            else:
+                try:
+                    files_to_copy = [f for f in source_dir.iterdir() if f.is_file()]
+                except OSError:
+                    files_to_copy = [source_file]
+            for f in files_to_copy:
+                dest = output_dir / f.name
+                if not dest.exists():
+                    shutil.copy2(f, dest)
+                    self._log(f"  Copied to output: {f.name}")
+        except Exception as e:
+            self._log(f"  ⚠ Could not copy source to output: {e}")
 
     def _rename_to_suffix(self, path: Path, suffix: str) -> bool:
         if not suffix:
@@ -929,31 +1063,6 @@ class MainWindow(QMainWindow):
         except OSError as e:
             self._log(f"  ⚠ Could not rename {path.name}: {e}")
             return False
-
-    def _rename_to_suffix_on_error(self, row: int, suffix: str, has_container: bool = True):
-        try:
-            task_id = self._row_task_ids[row]
-            task = self._tasks_by_id.get(task_id)
-            if not task:
-                return
-            source_file = task.get("source")
-            if not source_file:
-                return
-            if has_container:
-                source_dir = source_file.parent
-                new_name = f"{source_dir.name}.{suffix}"
-                new_path = source_dir.parent / new_name
-                if source_dir != new_path:
-                    source_dir.rename(new_path)
-                    self._log(f"  Renamed (failed): {source_dir.name} -> {new_name}")
-            else:
-                new_name = f"{source_file.stem}.{suffix}{source_file.suffix}"
-                new_path = source_file.parent / new_name
-                if source_file.exists() and source_file != new_path:
-                    source_file.rename(new_path)
-                    self._log(f"  Renamed (failed): {source_file.name} -> {new_name}")
-        except OSError as e:
-            self._log(f"  ⚠ Could not rename failed source: {e}")
 
     def _on_baseline_fps(self, fps: float):
         if self._baseline_fps == 0.0:
@@ -1070,9 +1179,10 @@ class MainWindow(QMainWindow):
                 "fallback_language": self.fallback_language_combo.currentText(),
                 "prioritise_dts":   self.prioritise_dts_checkbox.isChecked(),
                 "rf_quality":       self.rf_spin.value(),
+                "rf_quality_4k":    self.rf_4k_spin.value(),
                 "success_suffix":   self.file_success_suffix.text().strip(),
                 "problem_suffix":   self.file_problem_suffix.text().strip(),
-                "delete_source":    self.delete_source_checkbox.isChecked(),
+                "delete_source":    self.delete_source_combo.currentText(),
                 "min_fps":          self.min_fps_spin.value(),
                 "cool_every":       self.cool_every_spin.value(),
                 "cool_mins":        self.cool_mins_spin.value(),
@@ -1107,12 +1217,14 @@ class MainWindow(QMainWindow):
                 self.prioritise_dts_checkbox.setChecked(prefs["prioritise_dts"])
             if "rf_quality" in prefs:
                 self.rf_spin.setValue(prefs["rf_quality"])
+            if "rf_quality_4k" in prefs:
+                self.rf_4k_spin.setValue(prefs["rf_quality_4k"])
             if "success_suffix" in prefs:
                 self.file_success_suffix.setText(prefs["success_suffix"])
             if "problem_suffix" in prefs:
                 self.file_problem_suffix.setText(prefs["problem_suffix"])
-            if "delete_source" in prefs:
-                self.delete_source_checkbox.setChecked(prefs["delete_source"])
+            if prefs.get("delete_source") in ("Keep", "Move to Bin", "Delete Permanently"):
+                self.delete_source_combo.setCurrentText(prefs["delete_source"])
             if "min_fps" in prefs:
                 self.min_fps_spin.setValue(prefs["min_fps"])
             if "cool_every" in prefs:

@@ -68,28 +68,22 @@ def select_audio_track(
                     return t
         return None
 
+    # DTS wins from any language — this is the primary purpose of
+    # prioritise_dts.  Language preference only applies when no DTS track exists.
     if prioritise_dts:
-        result = try_lang(resolved_language, True)
-        if result:
-            return result
+        for t in tracks:
+            if t.codec and "dts" in t.codec.lower():
+                return t
 
+    # No DTS available — apply language preference
     result = try_lang(resolved_language, False)
     if result:
         return result
 
     if fallback_language and fallback_language != audio_language:
-        if prioritise_dts:
-            result = try_lang(fallback_language, True)
-            if result:
-                return result
         result = try_lang(fallback_language, False)
         if result:
             return result
-
-    if prioritise_dts:
-        for t in tracks:
-            if is_preferred_codec(t):
-                return t
 
     return tracks[0]
 
