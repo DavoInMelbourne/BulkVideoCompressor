@@ -454,6 +454,7 @@ _ENCODER_MAP = {
     "av1":               "libsvtav1",
     "hevc_videotoolbox": "hevc_videotoolbox",
     "h264_videotoolbox": "h264_videotoolbox",
+    "copy":              "copy",   # remux — bitexact video copy, stream selection only
 }
 
 
@@ -592,6 +593,7 @@ def run_cli_job(
     encoder: str = "x265",
     encoder_preset: str = "medium",
     progress_file: Optional[str] = None,
+    hdr: bool = False,
 ) -> subprocess.Popen:
     """Encode a single file with ffmpeg. Audio is copied bitexactly.
 
@@ -625,20 +627,28 @@ def run_cli_job(
         args += ["-map", f"0:s:{si - 1}"]   # 0-based subtitle stream index
 
     args += ["-c:v", ffmpeg_encoder]
-    if encoder in ("hevc_videotoolbox", "h264_videotoolbox"):
+    if encoder == "copy":
+        pass  # bitexact copy — no quality params, no fps conversion
+    elif encoder in ("hevc_videotoolbox", "h264_videotoolbox"):
         # VideoToolbox uses -q:v (0–100, higher = better quality) instead of CRF/preset
         args += ["-q:v", str(int(rf)), "-allow_sw", "1"]
         # hvc1 tag ensures broad compatibility with Apple devices and smart TVs
         if encoder == "hevc_videotoolbox":
             args += ["-tag:v", "hvc1"]
+            if hdr:
+                args += [
+                    "-color_primaries", "bt2020",
+                    "-color_trc",       "smpte2084",
+                    "-colorspace",      "bt2020nc",
+                ]
     else:
         args += ["-crf", str(rf)]
         if encoder_preset:
             args += ["-preset", encoder_preset]
 
-    # 50 fps → 25 fps
-    if abs(fps - 50.0) < 1.0:
-        args += ["-r", "25"]
+        # 50 fps → 25 fps (not applicable to copy/hardware encodes)
+        if abs(fps - 50.0) < 1.0:
+            args += ["-r", "25"]
 
     args += [
         # Audio: bitexact stream copy — preserves codec, channels, and layout

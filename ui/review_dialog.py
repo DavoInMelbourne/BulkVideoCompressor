@@ -43,37 +43,47 @@ class ReviewDialog(QDialog):
             info = t["info"]
             audio = t["audio"]
             subs = t["subs"]
-
-            fps_str = f"{info.fps:.3f}".rstrip("0").rstrip(".")
-            audio_str = (
-                f"T{audio.index} · {audio.language or '?'} · Passthru"
-                if audio
-                else "None"
-            )
-            sub_parts = []
-            for s in subs:
-                kind = "Forced" if s.forced else ("SDH" if s.sdh else "Regular")
-                sub_parts.append(f"T{s.index} {kind} [{s.language or '?'}]")
+            is_skip = t.get("skip", False)
 
             def cell(text):
                 item = QTableWidgetItem(str(text))
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 return item
 
-            enc_label = {
-                "av1": "AV1",
-                "x265_12bit": "H.265 12-bit",
-                "x265": "H.265",
-                "x264": "H.264",
-                "hevc_videotoolbox": "H.265 HW",
-                "h264_videotoolbox": "H.264 HW",
-            }.get(t.get("encoder", "x265"), "H.265")
+            fps_str = f"{info.fps:.3f}".rstrip("0").rstrip(".")
             table.setItem(row, 0, QTableWidgetItem(t["source"].name))
-            table.setItem(row, 1, cell(f"{info.width}×{info.height} · {enc_label}"))
-            table.setItem(row, 2, cell(fps_str))
-            table.setItem(row, 3, cell(audio_str))
-            table.setItem(row, 4, QTableWidgetItem(", ".join(sub_parts) or "None"))
-            table.setItem(row, 5, cell("No ✓"))
+
+            if is_skip:
+                size_gb = info.file_size_bytes / 1_000_000_000
+                label = "Skip" if t.get("true_skip") else "Remux"
+                table.setItem(row, 1, cell(f"{info.width}×{info.height} · {label} ({size_gb:.1f}GB)"))
+                table.setItem(row, 2, cell(fps_str))
+                table.setItem(row, 3, cell("—"))
+                table.setItem(row, 4, cell("—"))
+                table.setItem(row, 5, cell("—"))
+            else:
+                audio_str = (
+                    f"T{audio.index} · {audio.language or '?'} · Passthru"
+                    if audio
+                    else "None"
+                )
+                sub_parts = []
+                for s in subs:
+                    kind = "Forced" if s.forced else ("SDH" if s.sdh else "Regular")
+                    sub_parts.append(f"T{s.index} {kind} [{s.language or '?'}]")
+                enc_label = {
+                    "av1": "AV1",
+                    "x265_12bit": "H.265 12-bit",
+                    "x265": "H.265",
+                    "x264": "H.264",
+                    "hevc_videotoolbox": "H.265 HW",
+                    "h264_videotoolbox": "H.264 HW",
+                }.get(t.get("encoder", "x265"), "H.265")
+                table.setItem(row, 1, cell(f"{info.width}×{info.height} · {enc_label}"))
+                table.setItem(row, 2, cell(fps_str))
+                table.setItem(row, 3, cell(audio_str))
+                table.setItem(row, 4, QTableWidgetItem(", ".join(sub_parts) or "None"))
+                table.setItem(row, 5, cell("No ✓"))
 
         layout.addWidget(table)
 

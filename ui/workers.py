@@ -263,7 +263,8 @@ class EncodeWorker(QThread):
         encoder_preset = t.get("encoder_preset", self.encoder_preset)
         rf = t.get("rf", self.rf)
 
-        self.log.emit(f"[{row + 1}] Encoding: {f.name}")
+        action = "Remuxing" if encoder == "copy" else "Encoding"
+        self.log.emit(f"[{row + 1}] {action}: {f.name}")
         self.progress.emit(row, 0, 0.0, "Starting…")
         proc = None
         try:
@@ -278,6 +279,7 @@ class EncodeWorker(QThread):
                 subtitle_forced_index=forced_idx,
                 encoder=encoder,
                 encoder_preset=encoder_preset,
+                hdr=getattr(info, "hdr", False),
             )
             self._current_proc = proc
             self._read_progress(proc, t, row)
@@ -375,8 +377,9 @@ class EncodeWorker(QThread):
                 # UI update
                 self.progress.emit(row, pct, fps, eta)
 
-                # Size checks
-                if pct >= 25 and not self._oversize_abort:
+                # Size checks — skipped for remux (copy) tasks since output size
+                # is expected to be close to source size.
+                if pct >= 25 and not self._oversize_abort and not t.get("skip"):
                     try:
                         if out.exists():
                             out_size = out.stat().st_size
@@ -482,8 +485,11 @@ class EncodeWorker(QThread):
         self.verified.emit(row, v_ok, v_msg)
         self.log.emit(f"  {'✓' if v_ok else '⚠'} {v_msg}\n")
 
-        # Check for reverse compression (output larger than source)
-        if v_ok and self._check_reverse_compression(f, out, row):
+        # Check for reverse compression (output larger than source).
+        # Skipped for remux tasks — a copy encode is intentionally not compressing;
+        # minor size increases from MKV overhead or small track savings are expected.
+        is_remux = t.get("skip", False)
+        if v_ok and not is_remux and self._check_reverse_compression(f, out, row):
             return  # compression_done already emitted by _check_reverse_compression
 
         self.compression_done.emit(row, v_ok, out)

@@ -36,6 +36,9 @@ class VideoInfo:
     fps: float = 0.0
     duration_secs: float = 0.0
     color_range: str = ""   # "limited" or "full" — passed through
+    video_codec: str = ""   # lowercase: "hevc", "av1", "h264", "avc", …
+    file_size_bytes: int = 0
+    hdr: bool = False       # True if PQ (smpte2084) transfer function detected
     audio_tracks: list[AudioTrack] = field(default_factory=list)
     subtitle_tracks: list[SubtitleTrack] = field(default_factory=list)
 
@@ -53,6 +56,7 @@ def _lang_norm(lang: str) -> str:
 
 def _probe_pymediainfo(path: Path) -> VideoInfo:
     info = VideoInfo()
+    info.file_size_bytes = path.stat().st_size
     mi = MediaInfo.parse(str(path))
 
     audio_idx = 0
@@ -77,6 +81,9 @@ def _probe_pymediainfo(path: Path) -> VideoInfo:
             except ValueError:
                 info.fps = 0.0
             info.color_range = (track.color_range or "").lower()
+            info.video_codec = (track.format or "").lower()
+            transfer = (getattr(track, "transfer_characteristics", None) or "").lower()
+            info.hdr = "2084" in transfer or transfer == "pq"
 
         elif t == "Audio":
             audio_idx += 1
@@ -117,6 +124,7 @@ def _probe_ffprobe(path: Path) -> VideoInfo:
     streams = data.get("streams", [])
 
     info = VideoInfo()
+    info.file_size_bytes = path.stat().st_size
     audio_idx = 0
     sub_idx = 0
 
@@ -133,6 +141,8 @@ def _probe_ffprobe(path: Path) -> VideoInfo:
             except Exception:
                 info.fps = 0.0
             info.color_range = s.get("color_range", "").lower()
+            info.video_codec = s.get("codec_name", "").lower()
+            info.hdr = s.get("color_transfer", "") == "smpte2084"
             try:
                 info.duration_secs = float(s.get("duration", 0))
             except (ValueError, TypeError):

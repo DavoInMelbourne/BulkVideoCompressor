@@ -14,6 +14,14 @@ from .languages import Language
 # Audio selection
 # ---------------------------------------------------------------------------
 
+_COMMENTARY_KEYWORDS = ("commentary", "director", "interview", "description", "narration")
+
+
+def _is_commentary(t: AudioTrack) -> bool:
+    title = t.title.lower()
+    return any(kw in title for kw in _COMMENTARY_KEYWORDS)
+
+
 def select_audio_track(
     tracks: list[AudioTrack],
     audio_language: Language,
@@ -36,6 +44,10 @@ def select_audio_track(
     """
     if not tracks:
         return None
+
+    # Exclude commentary/director tracks; fall back to all if nothing remains
+    non_commentary = [t for t in tracks if not _is_commentary(t)]
+    tracks = non_commentary if non_commentary else tracks
 
     def is_preferred_codec(t: AudioTrack) -> bool:
         if not t.codec:
