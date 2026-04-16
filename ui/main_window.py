@@ -999,6 +999,20 @@ class MainWindow(QMainWindow):
             self._log(f"  ⚠ SKIP copy failed for {source_file.name}: {e}\n")
             return
 
+        # Copy non-video extras (NFO, artwork, subtitles etc.) from source dir,
+        # same as the encode worker does. Use _copied_dirs to copy once per directory.
+        src_dir = source_file.parent
+        if src_dir not in self._copied_dirs:
+            self._copied_dirs.add(src_dir)
+            _video_exts = {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts"}
+            for extra in src_dir.iterdir():
+                if extra.is_file() and extra.suffix.lower() not in _video_exts:
+                    try:
+                        shutil.copy2(extra, output_path.parent / extra.name)
+                        self._log(f"  copied {extra.name}")
+                    except OSError as e:
+                        self._log(f"  ⚠ could not copy {extra.name}: {e}")
+
         if dir_info is not None:
             dir_info["done"].add(source_file)
             dir_info.setdefault("skip_count", 0)
