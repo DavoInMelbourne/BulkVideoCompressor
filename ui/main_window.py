@@ -178,6 +178,31 @@ class MainWindow(QMainWindow):
         self._update_rf_hint(DEFAULT_PRESET, self.rf_hint_label)
         self._update_rf_hint(DEFAULT_PRESET_4K, self.rf_4k_hint_label)
 
+        # Smart Skip
+        skip_grp = QGroupBox("Smart Skip (hevc / av1 already compressed)")
+        sl = QHBoxLayout(skip_grp)
+        sl.addWidget(QLabel("Skip 4K if under:"))
+        self.skip_threshold_4k_spin = QDoubleSpinBox()
+        self.skip_threshold_4k_spin.setRange(0, 200)
+        self.skip_threshold_4k_spin.setValue(20.0)
+        self.skip_threshold_4k_spin.setSingleStep(1.0)
+        self.skip_threshold_4k_spin.setDecimals(1)
+        self.skip_threshold_4k_spin.setSuffix(" GB")
+        self.skip_threshold_4k_spin.setToolTip("4K hevc/av1 files smaller than this are skipped (already well compressed).")
+        sl.addWidget(self.skip_threshold_4k_spin)
+        sl.addSpacing(20)
+        sl.addWidget(QLabel("Skip 1080p & below if under:"))
+        self.skip_threshold_1080p_spin = QDoubleSpinBox()
+        self.skip_threshold_1080p_spin.setRange(0, 200)
+        self.skip_threshold_1080p_spin.setValue(4.0)
+        self.skip_threshold_1080p_spin.setSingleStep(0.5)
+        self.skip_threshold_1080p_spin.setDecimals(1)
+        self.skip_threshold_1080p_spin.setSuffix(" GB")
+        self.skip_threshold_1080p_spin.setToolTip("1080p and below hevc/av1 files smaller than this are skipped.")
+        sl.addWidget(self.skip_threshold_1080p_spin)
+        sl.addStretch()
+        root.addWidget(skip_grp)
+
         # Language Preferences
         lang = QGroupBox("Language Preferences")
         ll = QHBoxLayout(lang)
@@ -235,6 +260,20 @@ class MainWindow(QMainWindow):
         self.file_problem_suffix.setText("Check")
         self.file_problem_suffix.setToolTip("Suffix added to folder/file on failed compress. Leave empty for no rename.")
         pl.addWidget(self.file_problem_suffix)
+        pl.addSpacing(20)
+        pl.addWidget(QLabel("Skip suffix:"))
+        self.file_skip_suffix = QLineEdit()
+        self.file_skip_suffix.setFixedWidth(80)
+        self.file_skip_suffix.setText("Skip")
+        self.file_skip_suffix.setToolTip("Suffix added to folder/file when skipped (already efficient codec). Leave empty for no rename.")
+        pl.addWidget(self.file_skip_suffix)
+        pl.addSpacing(20)
+        pl.addWidget(QLabel("Remux suffix:"))
+        self.file_remux_suffix = QLineEdit()
+        self.file_remux_suffix.setFixedWidth(80)
+        self.file_remux_suffix.setText("Remux")
+        self.file_remux_suffix.setToolTip("Suffix added to folder/file after a remux (stream copy with track selection). Leave empty for no rename.")
+        pl.addWidget(self.file_remux_suffix)
         pl.addSpacing(20)
         pl.addWidget(QLabel("After success:"))
         self.delete_source_combo = QComboBox()
@@ -523,21 +562,46 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Nothing found", "No files could be probed.")
             return
 
-        # Assign per-task encoder based on resolution
+        # Assign per-task encoder based on resolution; flag files to skip
         encoder_std, encoder_preset_std, _ = PRESETS[self.preset_combo.currentText()]
         encoder_4k, encoder_preset_4k, _ = PRESETS[self.preset_4k_combo.currentText()]
         rf_std = self.rf_spin.value()
         rf_4k = self.rf_4k_spin.value()
+        threshold_4k_bytes   = self.skip_threshold_4k_spin.value()   * 1_000_000_000
+        threshold_1080p_bytes = self.skip_threshold_1080p_spin.value() * 1_000_000_000
         for t in tasks:
             info = t["info"]
-            if info.height >= 2160 or info.width >= 3840:
+            is_4k = info.height >= 2160 or info.width >= 3840
+            if is_4k:
                 t["encoder"] = encoder_4k
                 t["encoder_preset"] = encoder_preset_4k
                 t["rf"] = rf_4k
+                threshold = threshold_4k_bytes
             else:
                 t["encoder"] = encoder_std
                 t["encoder_preset"] = encoder_preset_std
                 t["rf"] = rf_std
+                threshold = threshold_1080p_bytes
+            codec = info.video_codec.lower()
+            is_skip_candidate = (
+                codec in ("hevc", "av1")
+                and threshold > 0
+                and info.file_size_bytes < threshold
+            )
+            if is_skip_candidate:
+                t["skip"] = True
+                # Determine if a remux is actually needed (streams would be dropped)
+                # or if the file is already clean (true skip — just rename)
+                needs_remux = (
+                    len(info.audio_tracks) > 1
+                    or len(t["subs"]) < len(info.subtitle_tracks)
+                )
+                if needs_remux:
+                    t["encoder"] = "copy"
+                    t["encoder_preset"] = ""
+                    t["rf"] = 0
+                else:
+                    t["true_skip"] = True  # nothing to drop — rename only, no encode
 
         dlg = ReviewDialog(
             tasks, self.rf_spin.value(), self.preset_combo.currentText(), parent=self
@@ -593,16 +657,16 @@ class MainWindow(QMainWindow):
 
         source_root = Path(self.source_edit.text().strip())
         added = 0
-        skipped = 0
+        duplicates = 0
         for t in tasks:
             src = t["source"]
             if src in self._queued_sources:
-                skipped += 1
+                duplicates += 1
                 continue
             self._queued_sources.add(src)
             self._tasks_by_id[t["id"]] = t
             self._add_progress_row(src.name, t["id"])
-            self._pending_tasks.append((t, self._next_row))
+            row = self._next_row
             self._next_row += 1
             added += 1
             # Track files per source directory (for deferring multi-file dir operations)
@@ -614,10 +678,20 @@ class MainWindow(QMainWindow):
                     }
                 self._directory_results[src_dir]["total"] += 1
 
+            if t.get("true_skip"):
+                self._set_status(row, "Skipped", "#7f8c8d")
+                self._completed_rows.add(row)
+                if row < len(self._delete_btns):
+                    self._delete_btns[row].setEnabled(True)
+                out = t["output"]
+                QTimer.singleShot(0, lambda r=row, s=src, sr=source_root, o=out: self._handle_true_skip(r, s, sr, o))
+            else:
+                self._pending_tasks.append((t, row))
+
         self.progress_scroll.show()
-        msg = f"→ {added} file(s) added to encode queue."
-        if skipped:
-            msg += f" ({skipped} duplicate(s) skipped)"
+        msg = f"→ {added} file(s) added to queue."
+        if duplicates:
+            msg += f" ({duplicates} duplicate(s) skipped)"
         self._log(msg + "\n")
 
         if not self._encoding_active:
@@ -906,20 +980,66 @@ class MainWindow(QMainWindow):
             if row < len(self._delete_btns):
                     self._delete_btns[row].setEnabled(True)
 
+    def _handle_true_skip(self, row: int, source_file: Path, source_root: Path, output_path: Path):
+        """File needs no remux — copy to output dir and apply skip suffix."""
+        skip_suffix = self.file_skip_suffix.text().strip()
+        src_dir = source_file.parent
+        dir_info = self._directory_results.get(src_dir)
+        output_root = Path(self.output_edit.text().strip())
+        output_dir = output_path.parent
+        has_container = output_dir.resolve() != output_root.resolve()
+
+        size_gb = source_file.stat().st_size / 1_000_000_000 if source_file.exists() else 0
+
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_file, output_path)
+            self._log(f"  SKIP | {source_file.name} | already clean ({size_gb:.1f}GB) — copied to output\n")
+        except Exception as e:
+            self._log(f"  ⚠ SKIP copy failed for {source_file.name}: {e}\n")
+            return
+
+        if dir_info is not None:
+            dir_info["done"].add(source_file)
+            dir_info.setdefault("skip_count", 0)
+            dir_info["skip_count"] += 1
+            if len(dir_info["done"]) < dir_info["total"]:
+                return  # wait for remaining files in directory
+            # All done — determine suffix
+            if dir_info["failed_count"] > 0:
+                suffix = self.file_problem_suffix.text().strip()
+            elif dir_info.get("skip_count", 0) == dir_info["total"]:
+                suffix = skip_suffix
+            else:
+                suffix = self.file_success_suffix.text().strip()
+            if suffix:
+                target = output_dir if has_container else output_path
+                self._rename_to_suffix(target, suffix)
+        else:
+            if skip_suffix:
+                self._rename_to_suffix(output_path, skip_suffix)
+
+        if self.delete_source_combo.currentText() != "Keep":
+            self._delete_source_folder(row)
+
     def _on_compression_done(self, row: int, success: bool, output_path: Path):
         QTimer.singleShot(0, lambda: self._do_compression_done(row, success, output_path))
 
     def _do_compression_done(self, row: int, success: bool, output_path: Path):
         try:
-            success_suffix = self.file_success_suffix.text().strip()
+            task_id = self._row_task_ids[row] if row < len(self._row_task_ids) else None
+            task = self._tasks_by_id.get(task_id) if task_id is not None else None
+            is_remux = task.get("skip", False) if task else False
+
+            success_suffix = (
+                self.file_remux_suffix.text().strip() if is_remux
+                else self.file_success_suffix.text().strip()
+            )
             problem_suffix = self.file_problem_suffix.text().strip()
 
             delete_action = self.delete_source_combo.currentText()  # "Keep" / "Move to Bin" / "Delete Permanently"
             delete_source = delete_action != "Keep"
 
-            # Resolve task/source info
-            task_id = self._row_task_ids[row] if row < len(self._row_task_ids) else None
-            task = self._tasks_by_id.get(task_id) if task_id is not None else None
             source_file = task["source"] if task else None
             source_root = Path(self.source_edit.text().strip())
 
@@ -1180,9 +1300,13 @@ class MainWindow(QMainWindow):
                 "prioritise_dts":   self.prioritise_dts_checkbox.isChecked(),
                 "rf_quality":       self.rf_spin.value(),
                 "rf_quality_4k":    self.rf_4k_spin.value(),
-                "success_suffix":   self.file_success_suffix.text().strip(),
-                "problem_suffix":   self.file_problem_suffix.text().strip(),
-                "delete_source":    self.delete_source_combo.currentText(),
+                "success_suffix":       self.file_success_suffix.text().strip(),
+                "problem_suffix":       self.file_problem_suffix.text().strip(),
+                "skip_suffix":          self.file_skip_suffix.text().strip(),
+                "remux_suffix":         self.file_remux_suffix.text().strip(),
+                "skip_threshold_4k":    self.skip_threshold_4k_spin.value(),
+                "skip_threshold_1080p": self.skip_threshold_1080p_spin.value(),
+                "delete_source":        self.delete_source_combo.currentText(),
                 "min_fps":          self.min_fps_spin.value(),
                 "cool_every":       self.cool_every_spin.value(),
                 "cool_mins":        self.cool_mins_spin.value(),
@@ -1223,6 +1347,14 @@ class MainWindow(QMainWindow):
                 self.file_success_suffix.setText(prefs["success_suffix"])
             if "problem_suffix" in prefs:
                 self.file_problem_suffix.setText(prefs["problem_suffix"])
+            if "skip_suffix" in prefs:
+                self.file_skip_suffix.setText(prefs["skip_suffix"])
+            if "remux_suffix" in prefs:
+                self.file_remux_suffix.setText(prefs["remux_suffix"])
+            if "skip_threshold_4k" in prefs:
+                self.skip_threshold_4k_spin.setValue(prefs["skip_threshold_4k"])
+            if "skip_threshold_1080p" in prefs:
+                self.skip_threshold_1080p_spin.setValue(prefs["skip_threshold_1080p"])
             if prefs.get("delete_source") in ("Keep", "Move to Bin", "Delete Permanently"):
                 self.delete_source_combo.setCurrentText(prefs["delete_source"])
             if "min_fps" in prefs:

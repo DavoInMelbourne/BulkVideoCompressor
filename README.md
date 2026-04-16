@@ -22,17 +22,23 @@ Made with 💛 by **[Paul Davies](https://github.com/DavoInMelbourne)**
 
 - Recursively scans a source folder for video files across any number of subdirectories
 - Handles files with or without a dedicated container folder
-- Auto-detects resolution, FPS, audio tracks and subtitles per file
-- Review all files before encoding — see exactly what will be processed
+- Auto-detects resolution, FPS, codec, file size, audio tracks and subtitles per file
+- Review all files before encoding — see exactly what will be processed and which will be remuxed or skipped
 - **Encoding presets** — separate presets for 1080p and 4K content:
   - **Fast H.264 (Hardware)** — VideoToolbox h264, quality 50
-  - **Fast H.265 (Hardware)** — VideoToolbox HEVC, quality 50 (default)
+  - **Fast H.265 (Hardware)** — VideoToolbox HEVC, quality 50 (default for 4K)
   - **Fast H.264** — x264, fast preset, RF 22
   - **Balanced H.265** — x265, medium preset, RF 20
-  - **Quality H.265 12-bit** — x265 12-bit, medium preset, RF 20
+  - **Quality H.265 12-bit** — x265 12-bit, medium preset, RF 20 (default for 1080p)
   - **Quality AV1** — SVT-AV1, preset 4, RF 30
+- **HDR passthrough** — when encoding 4K HDR content with VideoToolbox, explicit BT.2020 / SMPTE ST 2084 colour flags are applied to ensure HDR metadata is preserved
+- **Smart Skip** — automatically identifies hevc/av1 files that are already efficiently compressed and routes them through the appropriate path without re-encoding:
+  - Configurable size thresholds — separate limits for 4K (default: 20 GB) and 1080p & below (default: 4 GB)
+  - **Remux** — if the file has multiple audio tracks or more subtitle tracks than will be kept, the video is copied bitexactly and the unwanted tracks are dropped. Produces a smaller file with no quality loss. Output written to the output directory
+  - **True skip** — if the file is already clean (single audio track, no subtitle tracks to drop), the file is copied as-is to the output directory. No ffmpeg processing needed
 - Audio **bitexact stream copy** — the original audio is copied byte-for-byte, preserving codec, channels, channel layout and bitrate
 - **Smart audio track selection** — configurable language preference with automatic fallback; prefers DTS/TrueHD within the chosen language, then falls back to the fallback language, then the first available track
+- **Commentary track filtering** — audio tracks whose title contains "commentary", "director", "interview", "description" or "narration" are automatically excluded from selection
 - **Language Preferences** — independent dropdowns for audio track language, subtitle language, and a fallback language used when the preferred language is not found:
   - **Original Language** (default) — uses the language of the first audio track in each file, so a mixed batch of English, Korean, French films each picks its own native language automatically
   - **Non-English** — always picks the first non-English track, regardless of language; useful for batches of foreign-language content
@@ -48,9 +54,11 @@ Made with 💛 by **[Paul Davies](https://github.com/DavoInMelbourne)**
 - **Reverse compression detection** — if the output is larger than the source, the original is copied to the output path instead
 - **Post-processing** — automatically rename and clean up after encoding:
   - Successful encode: output folder (or file) renamed with a custom suffix, e.g. `Movie.Done`
+  - Remux: output folder (or file) renamed with a separate remux suffix, e.g. `Movie.Remux`
+  - True skip: file copied to output directory and renamed with the skip suffix, e.g. `Movie.Skip`
   - Failed encode or zero compression (output no smaller than source): source folder renamed with the problem suffix, e.g. `Movie.Check`; source file is copied to the output so nothing is lost
   - Orphaned extras (subtitles, artwork etc.) are cleaned up if an encode fails partway through
-  - Optionally delete the source file/folder after a verified successful encode
+  - Optionally delete the source file/folder after a verified successful encode — applies to remux and true skip paths too
 - Scrollable per-file progress panel with FPS and ETA
 - Cancel individual files or stop everything immediately
 - Dismiss completed rows individually or clear all finished files
@@ -132,22 +140,41 @@ The app will be in `dist/`.
 6. **Subtitles** — preferred subtitle language (default: English)
 7. **Fallback** — language used for both audio and subtitles if the preferred language is not found in a file
 8. **Prioritise DTS** — when checked, DTS and TrueHD tracks are preferred within the selected language
-9. **RF Quality** — Constant Quality value (set automatically by preset; lower = better quality / larger file)
-10. **Success suffix** — text appended to the output folder/file name on success (e.g. `Done` → `Movie.Done`); leave blank to skip
-11. **Problem suffix** — text appended to the source folder/file name on failure (e.g. `Check` → `Movie.Check`); leave blank to skip
-12. **Delete source files** — if checked, deletes the source file and its folder after a verified successful encode
-13. **Min FPS** — minimum expected encoding FPS at 10% progress (see Thermal Safeguards below)
-14. **Cool every / for** — proactive cooldown interval (see Thermal Safeguards below)
-15. **ffmpeg Path** — auto-detected; override if needed
-14. Click **Scan & Review** to inspect detected settings
-15. Click **Add to Queue** to start encoding
+9. **RF Quality** — Constant Quality value (set automatically by preset; lower = better quality / larger file for software encoders; higher = better quality for VideoToolbox)
+10. **Skip 4K if under** — hevc/av1 files at 4K below this size are remuxed or skipped rather than re-encoded (default: 20 GB)
+11. **Skip 1080p & below if under** — hevc/av1 files at 1080p and below below this size are remuxed or skipped (default: 4 GB)
+12. **Success suffix** — text appended to the output folder/file on a successful encode (e.g. `Done` → `Movie.Done`)
+13. **Problem suffix** — text appended to the source folder/file on failure (e.g. `Check` → `Movie.Check`)
+14. **Skip suffix** — text appended to the output folder/file for true skips (e.g. `Skip` → `Movie.Skip`)
+15. **Remux suffix** — text appended to the output folder/file after a remux (e.g. `Remux` → `Movie.Remux`)
+16. **After success** — what to do with the source file/folder after a verified successful result (Keep / Move to Bin / Delete Permanently); applies to encode, remux and true skip paths
+17. **Min FPS** — minimum expected encoding FPS at 10% progress (see Thermal Safeguards below)
+18. **Cool every / for** — proactive cooldown interval (see Thermal Safeguards below)
+19. **ffmpeg Path** — auto-detected; override if needed
+20. Click **Scan & Review** to inspect detected settings
+21. Click **Add to Queue** to start encoding
+
+### Smart Skip decision logic
+
+When a file is probed as hevc or av1 and falls below the configured size threshold, it is routed automatically:
+
+| Condition | Action |
+|---|---|
+| Multiple audio tracks **or** subtitle tracks would be dropped | **Remux** — video copied bitexactly, selected audio + subtitles kept, rest dropped |
+| Single audio track **and** all subtitle tracks would be kept | **True skip** — copied as-is to output directory, no ffmpeg processing |
+
+In all cases the output ends up in the output directory and the configured suffix is applied.
 
 ### Post-processing behaviour
 
-| Scenario | has container folder | Result |
+| Scenario | Has container folder | Result |
 |---|---|---|
-| Success | Yes | Output folder renamed, e.g. `Movie` → `Movie.Done` |
-| Success | No (file in root) | Output file renamed, e.g. `Movie.mkv` → `Movie.Done.mkv` |
+| Encode success | Yes | Output folder renamed, e.g. `Movie` → `Movie.Done` |
+| Encode success | No (file in root) | Output file renamed, e.g. `Movie.mkv` → `Movie.Done.mkv` |
+| Remux success | Yes | Output folder renamed with remux suffix, e.g. `Movie` → `Movie.Remux` |
+| Remux success | No (file in root) | Output file renamed, e.g. `Movie.mkv` → `Movie.Remux.mkv` |
+| True skip | Yes | File copied to output folder, folder renamed with skip suffix, e.g. `Movie` → `Movie.Skip` |
+| True skip | No (file in root) | File copied to output, renamed e.g. `Movie.mkv` → `Movie.Skip.mkv` |
 | Failed/error | Yes | Source folder renamed, e.g. `Movie` → `Movie.Check` |
 | Failed/error | No (file in root) | Source file renamed, e.g. `Movie.mkv` → `Movie.Check.mkv` |
 | Delete source | Yes | Source file deleted, then source folder deleted |
@@ -159,12 +186,14 @@ The app will be in `dist/`.
 | -------------------- | ------ | ---------------------------------------------- |
 | Waiting              | Grey   | Queued, not yet started                        |
 | Encoding             | Blue   | Currently being encoded                        |
+| Remuxing             | Blue   | Stream copy in progress (no re-encode)         |
 | Running large        | Orange | Output is tracking larger than source at 25%   |
 | Scanning...          | Orange | Post-encode audio packet scan in progress      |
 | Safe to delete       | Green  | Verified — original can be removed (shows final FPS) |
 | Keep original        | Red    | Verification failed — do not delete source     |
 | Reverse compression  | Purple | Output was larger — original copied to output  |
 | Problem file         | Orange | File cannot reach minimum FPS threshold        |
+| Skipped              | Grey   | True skip — already clean, copied to output    |
 | Failed               | Red    | Encode failed                                  |
 | ERROR                | Red    | Unexpected crash (caught and logged)           |
 | Cancelled            | Grey   | Manually cancelled                             |
@@ -177,10 +206,11 @@ The app will be in `dist/`.
 | ----------------- | ------------------------------------------------------------ |
 | Video encoder     | Selectable per resolution — x264, x265, AV1, or VideoToolbox |
 | Quality mode      | Constant Quality (RF) or VideoToolbox quality level           |
-| Framerate         | Same as source; 50 fps is halved to 25 fps                   |
+| Framerate         | Same as source; 50 fps is halved to 25 fps (encode only)     |
 | Resolution / crop | No change (pass-through)                                     |
 | Audio             | Bitexact stream copy — codec, channels and layout preserved  |
 | Subtitles         | Forced, Regular, SDH — stream copy, never burned in          |
+| HDR               | BT.2020 / PQ colour flags preserved on 4K HDR VideoToolbox encodes |
 | Container         | MKV                                                          |
 
 ---
