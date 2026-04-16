@@ -384,7 +384,7 @@ class EncodeWorker(QThread):
                             if not _size_checked and projected > src_size:
                                 _size_checked = True
                                 self.size_warning.emit(row)
-                            if pct >= 50 and projected >= src_size:
+                            if pct >= 33 and projected >= src_size:
                                 self._oversize_abort = True
                                 self.log.emit(
                                     f"  ✗ Output tracking larger than source at {pct}% — aborting\n"

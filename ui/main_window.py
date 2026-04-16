@@ -833,7 +833,7 @@ class MainWindow(QMainWindow):
     def _on_size_warning(self, row: int):
         self._set_status(row, "⚠ Running large", "#e67e22")
         self._log(
-            f"  ⚠ Row {row + 1}: output is tracking larger than source — check at 50%\n"
+            f"  ⚠ Row {row + 1}: output is tracking larger than source — check at 33%\n"
         )
 
     def _on_progress(self, row: int, pct: int, fps: float, eta: str):
