@@ -553,32 +553,13 @@ class EncodeWorker(QThread):
                 self.log.emit(f"  ⚠ failed to copy {src.name}: {e}")
 
     def _cleanup_partial(self, out: Path):
-        """Remove partial output file and any orphaned extras (e.g. subtitles copied
-        before encoding started) from a failed/cancelled encode."""
+        """Remove the partial video file from a failed/cancelled encode.
+        Extras (NFO, subtitles, artwork) are left in place — post-processing
+        will copy the original source video alongside them."""
         try:
             if out.exists():
                 out.unlink()
                 self.log.emit(f"  Removed partial file: {out.name}")
-        except OSError:
-            pass
-        # If the output subdirectory now has no video files, remove any extras
-        # (subtitles, nfo, etc.) that were copied there before encoding started.
-        out_dir = out.parent
-        try:
-            video_exts = {".mkv", ".mp4", ".avi", ".mov", ".ts", ".m2ts"}
-            remaining = list(out_dir.iterdir())
-            has_video = any(f.suffix.lower() in video_exts for f in remaining)
-            if not has_video and remaining:
-                for f in remaining:
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
-                self.log.emit(f"  Removed orphaned extras from: {out_dir.name}")
-                try:
-                    out_dir.rmdir()
-                except OSError:
-                    pass
         except OSError:
             pass
 
