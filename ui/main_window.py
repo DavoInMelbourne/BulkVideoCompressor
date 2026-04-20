@@ -38,7 +38,7 @@ from ui.workers import EncodeWorker, ProbeWorker
 # (encoder, encoder_preset, default_rf)
 PRESETS: dict[str, tuple[str, str, float]] = {
     "Fast H.264 (Hardware)": ("h264_videotoolbox", "", 65.0),
-    "Fast H.265 (Hardware)": ("hevc_videotoolbox", "", 82.0),
+    "Fast H.265 (Hardware)": ("hevc_videotoolbox", "", 65.0),
     "Fast H.264": ("x264", "fast", 22.0),
     "Balanced H.265": ("x265", "medium", 18.0),
     "Quality H.265 12-bit": ("x265_12bit", "medium", 20.0),  # RF 20 = excellent quality
@@ -422,13 +422,9 @@ class MainWindow(QMainWindow):
         label.setText(self._rf_hint_text(preset_name))
 
     def _on_preset_changed(self, name: str):
-        _, _, rf = PRESETS[name]
-        self.rf_spin.setValue(rf)
         self._update_rf_hint(name, self.rf_hint_label)
 
     def _on_4k_preset_changed(self, name: str):
-        _, _, rf = PRESETS[name]
-        self.rf_4k_spin.setValue(rf)
         self._update_rf_hint(name, self.rf_4k_hint_label)
 
     def _on_reset_defaults(self):
@@ -572,17 +568,27 @@ class MainWindow(QMainWindow):
         for t in tasks:
             info = t["info"]
             is_4k = info.height >= 2160 or info.width >= 3840
+            codec = info.video_codec.lower()
+            is_x264 = codec in ("h264", "avc")
+
             if is_4k:
                 t["encoder"] = encoder_4k
                 t["encoder_preset"] = encoder_preset_4k
                 t["rf"] = rf_4k
                 threshold = threshold_4k_bytes
+            elif is_x264:
+                t["encoder"] = "x265"
+                t["encoder_preset"] = "fast"
+                t["rf"] = rf_std
+                t.pop("skip", None)
+                t.pop("true_skip", None)
+                threshold = threshold_1080p_bytes
             else:
                 t["encoder"] = encoder_std
                 t["encoder_preset"] = encoder_preset_std
                 t["rf"] = rf_std
                 threshold = threshold_1080p_bytes
-            codec = info.video_codec.lower()
+
             is_skip_candidate = (
                 codec in ("hevc", "av1")
                 and threshold > 0
@@ -1340,6 +1346,10 @@ class MainWindow(QMainWindow):
                 self.output_edit.setText(prefs["output_dir"])
             if prefs.get("ffmpeg_path"):
                 self.hb_path_edit.setText(prefs["ffmpeg_path"])
+            if "rf_quality" in prefs:
+                self.rf_spin.setValue(prefs["rf_quality"])
+            if "rf_quality_4k" in prefs:
+                self.rf_4k_spin.setValue(prefs["rf_quality_4k"])
             if prefs.get("preset") in PRESETS:
                 self.preset_combo.setCurrentText(prefs["preset"])
             if prefs.get("preset_4k") in PRESETS:
@@ -1353,10 +1363,6 @@ class MainWindow(QMainWindow):
                 self.fallback_language_combo.setCurrentText(prefs["fallback_language"])
             if "prioritise_dts" in prefs:
                 self.prioritise_dts_checkbox.setChecked(prefs["prioritise_dts"])
-            if "rf_quality" in prefs:
-                self.rf_spin.setValue(prefs["rf_quality"])
-            if "rf_quality_4k" in prefs:
-                self.rf_4k_spin.setValue(prefs["rf_quality_4k"])
             if "success_suffix" in prefs:
                 self.file_success_suffix.setText(prefs["success_suffix"])
             if "problem_suffix" in prefs:
