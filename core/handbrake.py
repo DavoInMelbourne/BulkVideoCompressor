@@ -678,9 +678,10 @@ def run_cli_job(
             stderr=subprocess.DEVNULL,
         )
 
-    # Legacy: pipe-based progress (used by tests / non-VideoToolbox)
+    # Structured progress to stdout — TTY-independent, machine-readable.
+    # -progress pipe:1 writes key=value blocks to fd 1 regardless of terminal.
     return subprocess.Popen(
-        args,
-        stderr=subprocess.STDOUT,
+        args + ["-progress", "pipe:1"],
+        stderr=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
     )

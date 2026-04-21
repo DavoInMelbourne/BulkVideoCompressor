@@ -6,7 +6,6 @@ from __future__ import annotations
 import itertools
 import os
 import platform
-import re
 import shutil
 import subprocess
 import time
@@ -144,15 +143,6 @@ class EncodeWorker(QThread):
     slow_file_abort = pyqtSignal(int)  # row_index — file can't reach min FPS
     compression_done = pyqtSignal(int, bool, object)  # row_index, success, output_path
     # QThread.finished is used directly — defining it here causes a double-fire
-
-    # Full progress line with parseable time (used for pct/eta)
-    _PCT_RE = re.compile(
-        r"fps=\s*([\d.]+).*?time=([\d:]+\.[\d]*).*?speed=\s*([\d.]+)x",
-        re.IGNORECASE,
-    )
-    # Minimal match — just fps present (used to reset stall timer when
-    # time=N/A, e.g. REMUX files with DTS-HD MA / TrueHD audio)
-    _FPS_RE = re.compile(r"fps=\s*([1-9][\d.]*)", re.IGNORECASE)
 
     def __init__(
         self,
@@ -357,6 +347,9 @@ class EncodeWorker(QThread):
         # whatever data is available (no blocking for a specific byte count).
         # Keep proc.stdout alive so the fd isn't garbage-collected.
         fd = proc.stdout.fileno()
+        # Accumulate key=value pairs from -progress pipe:1 output
+        _kv: dict[str, str] = {}
+        _blocks_parsed = 0
 
         while True:
             try:
@@ -366,24 +359,59 @@ class EncodeWorker(QThread):
             if not chunk:
                 break
 
-            buf += chunk.decode("utf-8", errors="replace")
 
-            # Parse all complete progress lines
-            while "\r" in buf:
-                line, buf = buf.split("\r", 1)
-                m = self._PCT_RE.search(line)
-                if m:
-                    _last_progress = time.monotonic()
-                    fps = float(m.group(1))
-                    cur = _parse_time(m.group(2))
-                    speed = float(m.group(3)) or 0.001
-                    pct = int(min(99, cur / duration * 100)) if duration > 0 else 0
-                    eta = _fmt_eta((duration - cur) / speed) if duration > 0 else ""
-                elif self._FPS_RE.search(line):
-                    # time=N/A (e.g. REMUX with DTS-HD MA / TrueHD) — process is
-                    # alive and encoding; reset stall timer even without timestamps.
-                    _last_progress = time.monotonic()
-                    fps = float(self._FPS_RE.search(line).group(1))
+            buf += chunk.decode("utf-8", errors="replace")
+            buf = buf.replace("\r", "\n")
+
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+                if "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip()
+                _kv[k] = v
+
+                # Each progress block ends with progress=continue|end
+                if k != "progress":
+                    continue
+
+                _fps_str = _kv.get("fps", "")
+                _time_str = _kv.get("out_time", "")
+                _speed_str = _kv.get("speed", "").rstrip("x").strip()
+                _frame_str = _kv.get("frame", "")
+                _blocks_parsed += 1
+                _kv = {}
+
+                if not _fps_str:
+                    continue
+
+                try:
+                    _fps_val = float(_fps_str)
+                except ValueError:
+                    continue
+
+                _last_progress = time.monotonic()
+                fps = _fps_val
+
+                try:
+                    _time_ok = _time_str and _time_str != "N/A"
+                    _speed_ok = _speed_str and _speed_str != "N/A"
+                    if _time_ok and _speed_ok and duration > 0:
+                        cur = _parse_time(_time_str)
+                        speed = float(_speed_str) or 0.001
+                        pct = int(min(99, cur / duration * 100))
+                        eta = _fmt_eta((duration - cur) / speed)
+                    elif _frame_str and duration > 0 and fps > 0:
+                        # out_time=N/A (e.g. VideoToolbox): derive position from frame count
+                        source_fps = t["info"].fps or fps
+                        total_frames = duration * source_fps
+                        cur_frame = int(_frame_str)
+                        pct = int(min(99, cur_frame / total_frames * 100))
+                        remaining = (total_frames - cur_frame) / fps
+                        eta = _fmt_eta(remaining)
+                except (ValueError, TypeError):
+                    pass
 
             # Periodic checks — at most once per 5 seconds
             now = time.monotonic()
