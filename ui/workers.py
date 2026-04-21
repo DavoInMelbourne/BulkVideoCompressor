@@ -201,6 +201,7 @@ class EncodeWorker(QThread):
             self.log.emit(f"  ✗ CRASH caught: {e}\n")
             self._kill_proc_hard()
             self._cleanup_partial(t["output"])
+            self._fallback_copy(t["source"], t["output"], self.row)
             self.crashed.emit(self.row, str(e))
         finally:
             self._current_id = None
@@ -246,6 +247,18 @@ class EncodeWorker(QThread):
     # Encoding
     # ------------------------------------------------------------------
 
+    def _fallback_copy(self, source: Path, out: Path, row: int):
+        """Copy source to output when encoding failed — ensures target is always populated."""
+        dest = out.with_suffix(source.suffix)
+        if dest.exists():
+            return
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(source), str(dest))
+            self.log.emit(f"  Copied original to output: {dest.name}\n")
+        except OSError as e:
+            self.log.emit(f"  ⚠ Could not copy original to output: {e}\n")
+
     def _encode(self, t: dict, row: int):
         f, out = t["source"], t["output"]
         info = t["info"]
@@ -287,6 +300,7 @@ class EncodeWorker(QThread):
             self.log.emit(f"  ✗ Encoding error: {e}\n")
             self.task_done.emit(row, False)
             self._cleanup_partial(out)
+            self._fallback_copy(f, out, row)
             self.compression_done.emit(row, False, t["source"])
             return
         finally:
@@ -311,6 +325,8 @@ class EncodeWorker(QThread):
 
         if self._slow_file_abort:
             self._cleanup_partial(out)
+            # Don't copy here — task may be re-queued for a retry.
+            # _fallback_copy is called by _on_slow_file_abort once retries are exhausted.
             self.slow_file_abort.emit(row)
             return  # Don't emit compression_done - will retry or handled by _on_slow_file_abort
         elif self._oversize_abort:
@@ -387,7 +403,10 @@ class EncodeWorker(QThread):
                             if not _size_checked and projected > src_size:
                                 _size_checked = True
                                 self.size_warning.emit(row)
-                            if pct >= 33 and projected >= src_size:
+                            # Wait until 55% before aborting, and only if projected
+                            # is >10% larger — x265 look-ahead and complex opening
+                            # scenes make early projections unreliable for x264→x265.
+                            if pct >= 55 and projected > src_size * 1.10:
                                 self._oversize_abort = True
                                 self.log.emit(
                                     f"  ✗ Output tracking larger than source at {pct}% — aborting\n"
@@ -459,6 +478,7 @@ class EncodeWorker(QThread):
             self.skipped.emit(row)
             self.log.emit("  ✗ Cancelled\n")
             self._cleanup_partial(out)
+            self._fallback_copy(f, out, row)
             self.compression_done.emit(row, False, out)
             return
 
@@ -469,6 +489,7 @@ class EncodeWorker(QThread):
         )
         if not ok:
             self._cleanup_partial(out)
+            self._fallback_copy(f, out, row)
             self.compression_done.emit(row, False, out)
             return
 
