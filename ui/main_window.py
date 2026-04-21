@@ -913,7 +913,7 @@ class MainWindow(QMainWindow):
     def _on_size_warning(self, row: int):
         self._set_status(row, "⚠ Running large", "#e67e22")
         self._log(
-            f"  ⚠ Row {row + 1}: output is tracking larger than source — check at 33%\n"
+            f"  ⚠ Row {row + 1}: output is tracking larger than source — monitoring to 55%\n"
         )
 
     def _on_progress(self, row: int, pct: int, fps: float, eta: str):
@@ -1244,6 +1244,17 @@ class MainWindow(QMainWindow):
                     self._delete_btns[row].setEnabled(True)
             self._log(f"  ⚠ Still below {self.min_fps_spin.value()} FPS on retry — marking as problem file\n")
             self._problem_file_count += 1
+
+            # Ensure source is copied to output since the encode was aborted
+            output_path = t["output"]
+            dest = output_path.with_suffix(source_path.suffix)
+            if not dest.exists():
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(source_path), str(dest))
+                    self._log(f"  Copied original to output: {dest.name}\n")
+                except OSError as e:
+                    self._log(f"  ⚠ Could not copy original to output: {e}\n")
 
             # Handle renaming for problem files from slow file abort
             self._on_compression_done(row, False, source_path)
